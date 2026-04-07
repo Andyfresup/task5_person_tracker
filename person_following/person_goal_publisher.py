@@ -190,6 +190,27 @@ class PersonGoalPublisher:
         self.return_table_plan_retry_interval = rospy.get_param("~return_table_plan_retry_interval", 1.0)
         self.return_table_goal_republish = rospy.get_param("~return_table_goal_republish", 2)
         self.return_table_arrive_distance = rospy.get_param("~return_table_arrive_distance", 0.35)
+        default_yolo_perception_dir = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "26-WrightEagle.AI-YOLO-Perception",
+            )
+        )
+        self.table_food_check_enabled = rospy.get_param("~table_food_check_enabled", True)
+        self.table_food_check_delay = rospy.get_param("~table_food_check_delay", 1.0)
+        self.table_food_detect_command = rospy.get_param("~table_food_detect_command", "")
+        self.table_food_detect_use_shell = rospy.get_param("~table_food_detect_use_shell", False)
+        self.table_food_detect_timeout = rospy.get_param("~table_food_detect_timeout", 8.0)
+        self.table_food_detect_workdir = rospy.get_param(
+            "~table_food_detect_workdir",
+            default_yolo_perception_dir,
+        )
+        self.table_food_detection_json_file = rospy.get_param(
+            "~table_food_detection_json_file",
+            os.path.join(default_yolo_perception_dir, "detections.json"),
+        )
         self.serving_target_enabled = rospy.get_param("~serving_target_enabled", True)
         default_serving_target_snapshot_file = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "serving_target_snapshot.json")
@@ -401,6 +422,8 @@ class PersonGoalPublisher:
         self.return_navigation_state = "IDLE"
         self.return_table_goal = None
         self.return_table_plan_attempt_time = rospy.Time(0)
+        self.table_front_arrive_time = rospy.Time(0)
+        self.table_food_check_done = False
         self.last_serving_target_capture_time = rospy.Time(0)
         self.gaze_stable_since = None
         self.last_gaze_stable_capture_time = rospy.Time(0)
@@ -1729,6 +1752,8 @@ class PersonGoalPublisher:
         self.return_navigation_state = "GO_TO_ANCHOR"
         self.return_table_goal = None
         self.return_table_plan_attempt_time = rospy.Time(0)
+        self.table_front_arrive_time = rospy.Time(0)
+        self.table_food_check_done = False
         self.goal_publish_paused = True
         self._set_serving_customer_state("RETURNING")
 
@@ -1775,6 +1800,8 @@ class PersonGoalPublisher:
 
             self.return_table_goal = (sx, sy, theta)
             self.return_navigation_state = "TABLE_APPROACH"
+            self.table_front_arrive_time = rospy.Time(0)
+            self.table_food_check_done = False
             self._set_serving_customer_state("TABLE_APPROACH")
 
             republish = max(1, int(self.return_table_goal_republish))
@@ -1794,8 +1821,13 @@ class PersonGoalPublisher:
             dist_to_table = math.hypot(rx - sx, ry - sy)
             if dist_to_table <= self.return_table_arrive_distance:
                 self.return_navigation_state = "AT_TABLE_FRONT"
+                self.table_front_arrive_time = rospy.Time.now()
+                self.table_food_check_done = False
                 self._set_serving_customer_state("AT_TABLE_FRONT")
                 rospy.loginfo("Arrived at table/bar front serving position.")
+
+        if self.return_navigation_state == "AT_TABLE_FRONT":
+            self._run_table_food_missing_check_cycle()
 
     def _store_food_order(self, source_text, food_summary, food_mentions):
         if not self.food_order_enabled or not food_summary:
@@ -1860,6 +1892,247 @@ class PersonGoalPublisher:
                 rospy.logwarn("Failed to publish food order JSON: %s", exc)
 
         return payload, stored_to_file
+
+    def _resolve_table_food_detection_json_path(self):
+        raw_path = str(self.table_food_detection_json_file).strip()
+        if not raw_path:
+            return ""
+
+        try:
+            raw_path = raw_path.format(
+                customer_folder=self.active_customer_folder,
+                customer_id=self.active_customer_id,
+            )
+        except Exception:
+            pass
+
+        if os.path.isabs(raw_path):
+            return raw_path
+
+        workdir = str(self.table_food_detect_workdir).strip()
+        if workdir:
+            return os.path.join(workdir, raw_path)
+        return os.path.abspath(raw_path)
+
+    def _append_detected_food_name(self, raw_name, detected_set):
+        if not isinstance(detected_set, set):
+            return
+        canonical = self._canonicalize_food_name(raw_name)
+        if canonical:
+            detected_set.add(canonical)
+
+    def _extract_detected_foods_from_payload(self, payload):
+        detected = set()
+
+        entries = []
+        if isinstance(payload, list):
+            entries.extend(payload)
+        elif isinstance(payload, dict):
+            for key in ("objects", "items", "detections", "results"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    entries.extend(value)
+
+            for key in ("labels", "detected_labels", "foods", "detected_foods"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    entries.extend(value)
+                elif isinstance(value, str):
+                    entries.append(value)
+
+            if not entries:
+                entries.append(payload)
+
+        for item in entries:
+            if isinstance(item, str):
+                self._append_detected_food_name(item, detected)
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
+            for key in ("label", "name", "class", "category", "object", "food"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    self._append_detected_food_name(value, detected)
+                    break
+
+        return detected
+
+    def _extract_detected_foods_from_text(self, text):
+        detected = set()
+        raw = str(text or "")
+        if not raw:
+            return detected
+
+        blob = self._extract_json_blob(raw)
+        if blob:
+            try:
+                payload = json.loads(blob)
+                detected.update(self._extract_detected_foods_from_payload(payload))
+            except Exception:
+                pass
+
+        for match in re.finditer(r"(?:类别|class|label)\s*[:：]\s*([^\n|]+)", raw, flags=re.IGNORECASE):
+            token = str(match.group(1)).strip()
+            if token:
+                self._append_detected_food_name(token, detected)
+
+        return detected
+
+    def _load_detected_foods_from_json_file(self, path):
+        detected = set()
+        if not path or not os.path.isfile(path):
+            return detected
+
+        latest_payload = None
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                tail_lines = deque(fp, maxlen=200)
+
+            for line in reversed(tail_lines):
+                row = str(line).strip()
+                if not row:
+                    continue
+                try:
+                    latest_payload = json.loads(row)
+                    break
+                except Exception:
+                    continue
+
+            if latest_payload is None:
+                with open(path, "r", encoding="utf-8") as fp:
+                    latest_payload = json.load(fp)
+        except Exception as exc:
+            rospy.logwarn("Failed to parse detection JSON file (%s): %s", path, exc)
+            return detected
+
+        detected.update(self._extract_detected_foods_from_payload(latest_payload))
+        return detected
+
+    def _run_table_food_detection(self):
+        detected = set()
+        detection_json_path = self._resolve_table_food_detection_json_path()
+
+        cmd_template = str(self.table_food_detect_command).strip()
+        if cmd_template:
+            try:
+                command = cmd_template.format(
+                    customer_folder=self.active_customer_folder,
+                    customer_id=self.active_customer_id,
+                    detection_json=detection_json_path,
+                    yolo_repo=self.table_food_detect_workdir,
+                )
+            except Exception:
+                command = cmd_template
+
+            timeout_sec = max(0.5, float(self.table_food_detect_timeout))
+            workdir = str(self.table_food_detect_workdir).strip()
+            cwd = workdir if (workdir and os.path.isdir(workdir)) else None
+
+            try:
+                if self.table_food_detect_use_shell:
+                    proc = subprocess.run(
+                        command,
+                        shell=True,
+                        cwd=cwd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout_sec,
+                    )
+                else:
+                    proc = subprocess.run(
+                        shlex.split(command),
+                        shell=False,
+                        cwd=cwd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=timeout_sec,
+                    )
+
+                output_text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                detected.update(self._extract_detected_foods_from_text(output_text))
+
+                if proc.returncode != 0:
+                    rospy.logwarn("Table food detect command exit code %s", proc.returncode)
+            except subprocess.TimeoutExpired as exc:
+                timeout_output = ((exc.stdout or "") + "\n" + (exc.stderr or "")).strip()
+                detected.update(self._extract_detected_foods_from_text(timeout_output))
+                rospy.logwarn("Table food detect command timed out after %.1fs", timeout_sec)
+            except Exception as exc:
+                rospy.logwarn("Table food detect command failed: %s", exc)
+
+        if detection_json_path:
+            detected.update(self._load_detected_foods_from_json_file(detection_json_path))
+
+        return detected
+
+    def _get_ordered_foods_for_table_check(self):
+        ordered = []
+        self._resolve_active_customer_folder()
+        self._load_food_orders_from_json()
+
+        with self.food_order_lock:
+            if isinstance(self.current_needed_foods_qty, dict) and self.current_needed_foods_qty:
+                for name, qty in self.current_needed_foods_qty.items():
+                    try:
+                        if int(qty) <= 0:
+                            continue
+                    except Exception:
+                        continue
+                    canonical = self._canonicalize_food_name(name)
+                    if canonical:
+                        ordered.append(canonical)
+            elif isinstance(self.current_needed_foods, list):
+                for name in self.current_needed_foods:
+                    canonical = self._canonicalize_food_name(name)
+                    if canonical:
+                        ordered.append(canonical)
+
+        unique_ordered = []
+        seen = set()
+        for food in ordered:
+            if food in seen:
+                continue
+            seen.add(food)
+            unique_ordered.append(food)
+        return unique_ordered
+
+    def _run_table_food_missing_check_cycle(self):
+        if not self.table_food_check_enabled:
+            return
+        if self.table_food_check_done:
+            return
+        if self.return_navigation_state != "AT_TABLE_FRONT":
+            return
+
+        now = rospy.Time.now()
+        if self.table_front_arrive_time == rospy.Time(0):
+            self.table_front_arrive_time = now
+            return
+
+        if (now - self.table_front_arrive_time).to_sec() < max(0.0, float(self.table_food_check_delay)):
+            return
+
+        self.table_food_check_done = True
+        ordered_foods = self._get_ordered_foods_for_table_check()
+        if not ordered_foods:
+            rospy.logwarn("Table food check skipped: no ordered foods in active customer folder.")
+            return
+
+        detected_foods = self._run_table_food_detection()
+        missing_foods = [food for food in ordered_foods if food not in detected_foods]
+
+        if not missing_foods:
+            rospy.loginfo("Table food check passed: all ordered foods were detected.")
+            return
+
+        missing_names = [name.replace("_", " ") for name in missing_foods]
+        announce = "The customer wants %s" % ", ".join(missing_names)
+        self._announce_text_prompt(announce, force=True)
+        rospy.loginfo("Table food check missing items: %s", ", ".join(missing_names))
 
     def _load_pause_speech_tts(self):
         if not self.pause_prompt_use_speech_module:
