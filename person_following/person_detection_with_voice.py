@@ -771,6 +771,8 @@ def main():
         nonlocal serving_target_capture_pending
         nonlocal serving_target_capture_request
         nonlocal serving_target_capture_time
+        nonlocal active_customer_folder
+        nonlocal active_customer_id
 
         raw = str(msg.data).strip()
         if not raw:
@@ -799,6 +801,15 @@ def main():
                 except Exception:
                     x, y, z = 0.0, 0.0, 0.0
             frame = str(payload.get("frame_id", frame_id))
+
+            folder = str(payload.get("customer_folder", "")).strip()
+            if folder and os.path.isdir(folder):
+                active_customer_folder = folder
+                active_customer_id = os.path.basename(folder.rstrip("/"))
+
+            cid = str(payload.get("customer_id", "")).strip()
+            if cid and not active_customer_id:
+                active_customer_id = cid
 
         serving_target_capture_pending = True
         serving_target_capture_request = {
