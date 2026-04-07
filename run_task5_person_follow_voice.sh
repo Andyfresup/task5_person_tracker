@@ -4,6 +4,39 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+DEFAULT_SPEECH_MODULE_FILE="$SCRIPT_DIR/../26-WrightEagle.AI-Speech/src/tts/synthesizer.py"
+SPEECH_MODULE_FILE="${SPEECH_MODULE_FILE:-$DEFAULT_SPEECH_MODULE_FILE}"
+USE_SPEECH_MODULE="${USE_SPEECH_MODULE:-true}"
+if [[ ! -f "$SPEECH_MODULE_FILE" ]]; then
+    USE_SPEECH_MODULE=false
+fi
+
+DEFAULT_SPEECH_ASR_FILE="$SCRIPT_DIR/../26-WrightEagle.AI-Speech/src/asr/vad-whisper.py"
+SPEECH_ASR_FILE="${SPEECH_ASR_FILE:-$DEFAULT_SPEECH_ASR_FILE}"
+USE_SPEECH_ASR_MODULE="${USE_SPEECH_ASR_MODULE:-true}"
+if [[ ! -f "$SPEECH_ASR_FILE" ]]; then
+    USE_SPEECH_ASR_MODULE=false
+fi
+
+if [[ -z "${DETECTION_ENABLE_VOICE:-}" ]]; then
+    if [[ "${USE_SPEECH_ASR_MODULE}" == "true" ]]; then
+        DETECTION_ENABLE_VOICE=false
+    else
+        DETECTION_ENABLE_VOICE=true
+    fi
+fi
+FOOD_ORDER_JSON_FILE="${FOOD_ORDER_JSON_FILE:-$SCRIPT_DIR/person_following/food_orders.json}"
+FOOD_SEMANTIC_ENABLED="${FOOD_SEMANTIC_ENABLED:-true}"
+FOOD_SEMANTIC_BACKEND="${FOOD_SEMANTIC_BACKEND:-auto}"
+FOOD_SEMANTIC_COMMAND="${FOOD_SEMANTIC_COMMAND:-}"
+FOOD_SEMANTIC_COMMAND_USE_SHELL="${FOOD_SEMANTIC_COMMAND_USE_SHELL:-false}"
+FOOD_SEMANTIC_MODEL_PATH="${FOOD_SEMANTIC_MODEL_PATH:-}"
+FOOD_SEMANTIC_TASK="${FOOD_SEMANTIC_TASK:-text-generation}"
+FOOD_SEMANTIC_TIMEOUT="${FOOD_SEMANTIC_TIMEOUT:-8.0}"
+FOOD_SEMANTIC_OLLAMA_URL="${FOOD_SEMANTIC_OLLAMA_URL:-}"
+FOOD_SEMANTIC_OLLAMA_MODEL="${FOOD_SEMANTIC_OLLAMA_MODEL:-llama3.2:1b}"
+RETURN_ANCHOR_JSON_FILE="${RETURN_ANCHOR_JSON_FILE:-$SCRIPT_DIR/person_following/return_anchor.json}"
+
 pids=()
 cleanup() {
     for pid in "${pids[@]:-}"; do
@@ -64,6 +97,33 @@ python3 person_following/person_goal_publisher.py \
     _gaze_distance_tolerance:=0.12 \
     _gaze_collision_probe_distance:=0.55 \
     _gaze_person_timeout:=0.6 \
+    _pause_prompt_enabled:=true \
+    _pause_prompt_text:="What do you want" \
+    _pause_prompt_use_speech_module:=${USE_SPEECH_MODULE} \
+    _pause_prompt_speech_module_file:=${SPEECH_MODULE_FILE} \
+    _pause_reply_listen_enabled:=true \
+    _pause_reply_use_speech_module:=${USE_SPEECH_ASR_MODULE} \
+    _pause_reply_speech_module_file:=${SPEECH_ASR_FILE} \
+    _pause_reply_timeout:=6.0 \
+    _pause_reply_start_delay:=1.2 \
+    _pause_reply_reask_on_unrecognized:=true \
+    _pause_reply_reask_text:="Can I beg you a pardon?" \
+    _pause_reply_reask_max_attempts:=1 \
+    _pause_reply_reask_listen_delay:=1.1 \
+    _pause_reply_topic:=/person_following/pause_reply_text \
+    _food_order_enabled:=true \
+    _food_order_json_file:=${FOOD_ORDER_JSON_FILE} \
+    _food_order_confirm_enabled:=true \
+    "_food_order_confirm_template:=OK, I'll get {foods} for you" \
+    _food_semantic_enabled:=${FOOD_SEMANTIC_ENABLED} \
+    _food_semantic_backend:=${FOOD_SEMANTIC_BACKEND} \
+    "_food_semantic_command:=${FOOD_SEMANTIC_COMMAND}" \
+    _food_semantic_command_use_shell:=${FOOD_SEMANTIC_COMMAND_USE_SHELL} \
+    "_food_semantic_model_path:=${FOOD_SEMANTIC_MODEL_PATH}" \
+    _food_semantic_transformers_task:=${FOOD_SEMANTIC_TASK} \
+    _food_semantic_timeout:=${FOOD_SEMANTIC_TIMEOUT} \
+    "_food_semantic_ollama_url:=${FOOD_SEMANTIC_OLLAMA_URL}" \
+    _food_semantic_ollama_model:=${FOOD_SEMANTIC_OLLAMA_MODEL} \
     _run_rate_hz:=20.0 &
  pids+=("$!")
 
@@ -78,8 +138,13 @@ python3 person_following/cmd_vel_arbiter.py \
 python3 person_following/person_detection_with_voice.py \
     _person_topic:=/person/base_link_3d_position \
     _frame_id:=base_link \
+    _return_anchor_enabled:=true \
+    _return_anchor_frame:=map \
+    _return_anchor_base_frame:=base_link \
+    _return_anchor_topic:=/person_following/return_anchor \
+    _return_anchor_json_file:=${RETURN_ANCHOR_JSON_FILE} \
     _show_debug:=false \
-    _enable_voice:=true \
+    _enable_voice:=${DETECTION_ENABLE_VOICE} \
     _whisper_model:=small \
     _enable_search_rotation:=true \
     _costmap_topic:=/person_following/occupancy_grid &

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # person detection + raised-hand gesture + voice call detection
 
+import json
+import os
 import threading
 import time
 import queue
@@ -9,8 +11,9 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 import rospy
+import tf2_ros
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PointStamped, Twist
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 from ultralytics import YOLO
 
 try:
@@ -404,11 +407,32 @@ def main():
     enable_voice = rospy.get_param("~enable_voice", True)
     whisper_model = rospy.get_param("~whisper_model", "small")
 
+    # Record first trigger location (voice call or raised hand) as return anchor.
+    return_anchor_enabled = rospy.get_param("~return_anchor_enabled", True)
+    return_anchor_topic = rospy.get_param("~return_anchor_topic", "/person_following/return_anchor")
+    return_anchor_frame = rospy.get_param("~return_anchor_frame", "map")
+    return_anchor_base_frame = rospy.get_param("~return_anchor_base_frame", frame_id)
+    return_anchor_lookup_timeout = rospy.get_param("~return_anchor_lookup_timeout", 0.2)
+    default_return_anchor_file = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "return_anchor.json")
+    )
+    return_anchor_json_file = rospy.get_param("~return_anchor_json_file", default_return_anchor_file)
+
     cam_to_base_x = rospy.get_param("~cam_to_base_x", 0.0)
     cam_to_base_y = rospy.get_param("~cam_to_base_y", 0.0)
     cam_to_base_z = rospy.get_param("~cam_to_base_z", 0.0)
 
     pub = rospy.Publisher(person_topic, PointStamped, queue_size=1)
+    return_anchor_pub = None
+    if return_anchor_enabled and return_anchor_topic:
+        return_anchor_pub = rospy.Publisher(return_anchor_topic, PoseStamped, queue_size=1, latch=True)
+
+    tf_buffer = None
+    tf_listener = None
+    if return_anchor_enabled:
+        tf_buffer = tf2_ros.Buffer()
+        tf_listener = tf2_ros.TransformListener(tf_buffer)
+
     controller = RobotController(enabled=enable_search_rotation)
 
     voice_detector = None
@@ -426,9 +450,92 @@ def main():
     tracks = {}
     next_track_id = 1
     locked_track_id = None
+    return_anchor_recorded = False
+    return_anchor_trigger_reason = None
+    return_anchor_trigger_track_id = None
+
+    def _try_record_return_anchor(reason, track_id):
+        nonlocal return_anchor_recorded
+        if not return_anchor_enabled or return_anchor_recorded:
+            return False
+        if tf_buffer is None:
+            return False
+
+        try:
+            tf_msg = tf_buffer.lookup_transform(
+                return_anchor_frame,
+                return_anchor_base_frame,
+                rospy.Time(0),
+                rospy.Duration(return_anchor_lookup_timeout),
+            )
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as exc:
+            rospy.logwarn_throttle(1.0, "Return anchor TF lookup failed: %s", exc)
+            return False
+
+        pose = PoseStamped()
+        pose.header.stamp = rospy.Time.now()
+        pose.header.frame_id = return_anchor_frame
+        pose.pose.position.x = tf_msg.transform.translation.x
+        pose.pose.position.y = tf_msg.transform.translation.y
+        pose.pose.position.z = tf_msg.transform.translation.z
+        pose.pose.orientation.x = tf_msg.transform.rotation.x
+        pose.pose.orientation.y = tf_msg.transform.rotation.y
+        pose.pose.orientation.z = tf_msg.transform.rotation.z
+        pose.pose.orientation.w = tf_msg.transform.rotation.w
+
+        if return_anchor_pub is not None:
+            return_anchor_pub.publish(pose)
+
+        payload = {
+            "timestamp": pose.header.stamp.to_sec(),
+            "frame_id": pose.header.frame_id,
+            "trigger": reason,
+            "track_id": int(track_id) if track_id is not None else None,
+            "position": {
+                "x": pose.pose.position.x,
+                "y": pose.pose.position.y,
+                "z": pose.pose.position.z,
+            },
+            "orientation": {
+                "x": pose.pose.orientation.x,
+                "y": pose.pose.orientation.y,
+                "z": pose.pose.orientation.z,
+                "w": pose.pose.orientation.w,
+            },
+        }
+
+        if return_anchor_json_file:
+            try:
+                parent = os.path.dirname(return_anchor_json_file)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                tmp_path = return_anchor_json_file + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, return_anchor_json_file)
+            except Exception as exc:
+                rospy.logwarn("Failed to write return anchor JSON: %s", exc)
+
+        return_anchor_recorded = True
+        rospy.loginfo(
+            "Return anchor recorded at (%.2f, %.2f, %.2f), trigger=%s, track_id=%s",
+            pose.pose.position.x,
+            pose.pose.position.y,
+            pose.pose.position.z,
+            reason,
+            str(track_id),
+        )
+        return True
 
     try:
         while not rospy.is_shutdown():
+            if (
+                return_anchor_enabled
+                and not return_anchor_recorded
+                and return_anchor_trigger_reason is not None
+            ):
+                _try_record_return_anchor(return_anchor_trigger_reason, return_anchor_trigger_track_id)
+
             frames = pipeline.wait_for_frames()
             aligned_frames = align.process(frames)
             color_frame = aligned_frames.get_color_frame()
@@ -505,10 +612,18 @@ def main():
                     selected = choose_rightmost(raised_candidates)
                     rospy.loginfo("Locked raised-hand target: track_id=%d", selected["track_id"])
                     locked_track_id = selected["track_id"]
+                    if return_anchor_trigger_reason is None:
+                        return_anchor_trigger_reason = "raised_hand"
+                        return_anchor_trigger_track_id = selected["track_id"]
+                        _try_record_return_anchor(return_anchor_trigger_reason, return_anchor_trigger_track_id)
                 elif voice_triggered and all_candidates:
                     selected = choose_nearest(all_candidates)
                     rospy.loginfo("Locked voice-call target (nearest): track_id=%d", selected["track_id"])
                     locked_track_id = selected["track_id"]
+                    if return_anchor_trigger_reason is None:
+                        return_anchor_trigger_reason = "voice_call"
+                        return_anchor_trigger_track_id = selected["track_id"]
+                        _try_record_return_anchor(return_anchor_trigger_reason, return_anchor_trigger_track_id)
             else:
                 for c in all_candidates:
                     if c["track_id"] == locked_track_id:
