@@ -36,6 +36,15 @@ FOOD_SEMANTIC_TIMEOUT="${FOOD_SEMANTIC_TIMEOUT:-8.0}"
 FOOD_SEMANTIC_OLLAMA_URL="${FOOD_SEMANTIC_OLLAMA_URL:-}"
 FOOD_SEMANTIC_OLLAMA_MODEL="${FOOD_SEMANTIC_OLLAMA_MODEL:-llama3.2:1b}"
 RETURN_ANCHOR_JSON_FILE="${RETURN_ANCHOR_JSON_FILE:-$SCRIPT_DIR/person_following/return_anchor.json}"
+RETURN_TO_ANCHOR_ON_ORDER_CONFIRM="${RETURN_TO_ANCHOR_ON_ORDER_CONFIRM:-true}"
+SERVING_TARGET_CAPTURE_TOPIC="${SERVING_TARGET_CAPTURE_TOPIC:-/person_following/serving_target_capture}"
+SERVING_TARGET_CAPTURE_CMD_TOPIC="${SERVING_TARGET_CAPTURE_CMD_TOPIC:-/person_following/serving_target_capture_cmd}"
+SERVING_TARGET_SNAPSHOT_JSON_FILE="${SERVING_TARGET_SNAPSHOT_JSON_FILE:-$SCRIPT_DIR/person_following/serving_target_snapshot.json}"
+SERVING_TARGET_FACE_IMAGE_FILE="${SERVING_TARGET_FACE_IMAGE_FILE:-$SCRIPT_DIR/person_following/serving_target_face.jpg}"
+SERVING_TARGET_FACE_META_FILE="${SERVING_TARGET_FACE_META_FILE:-$SCRIPT_DIR/person_following/serving_target_face_meta.json}"
+CUSTOMER_DATA_ROOT="${CUSTOMER_DATA_ROOT:-$SCRIPT_DIR/person_following/service_customers}"
+ACTIVE_CUSTOMER_FOLDER_TOPIC="${ACTIVE_CUSTOMER_FOLDER_TOPIC:-/person_following/active_customer_folder}"
+SERVING_CUSTOMER_STATE_TOPIC="${SERVING_CUSTOMER_STATE_TOPIC:-/person_following/serving_customer_state}"
 
 pids=()
 cleanup() {
@@ -115,6 +124,17 @@ python3 person_following/person_goal_publisher.py \
     _food_order_json_file:=${FOOD_ORDER_JSON_FILE} \
     _food_order_confirm_enabled:=true \
     "_food_order_confirm_template:=OK, I'll get {foods} for you" \
+    _return_to_anchor_on_order_confirm:=${RETURN_TO_ANCHOR_ON_ORDER_CONFIRM} \
+    _return_anchor_json_file:=${RETURN_ANCHOR_JSON_FILE} \
+    _return_anchor_bridge_republish:=2 \
+    _serving_target_enabled:=true \
+    _serving_target_snapshot_json_file:=${SERVING_TARGET_SNAPSHOT_JSON_FILE} \
+    _serving_target_capture_topic:=${SERVING_TARGET_CAPTURE_TOPIC} \
+    _serving_target_capture_cmd_topic:=${SERVING_TARGET_CAPTURE_CMD_TOPIC} \
+    _customer_data_root:=${CUSTOMER_DATA_ROOT} \
+    _active_customer_folder_topic:=${ACTIVE_CUSTOMER_FOLDER_TOPIC} \
+    _serving_customer_state_topic:=${SERVING_CUSTOMER_STATE_TOPIC} \
+    _gaze_stable_face_capture_enabled:=true \
     _food_semantic_enabled:=${FOOD_SEMANTIC_ENABLED} \
     _food_semantic_backend:=${FOOD_SEMANTIC_BACKEND} \
     "_food_semantic_command:=${FOOD_SEMANTIC_COMMAND}" \
@@ -143,6 +163,13 @@ python3 person_following/person_detection_with_voice.py \
     _return_anchor_base_frame:=base_link \
     _return_anchor_topic:=/person_following/return_anchor \
     _return_anchor_json_file:=${RETURN_ANCHOR_JSON_FILE} \
+    _serving_target_capture_topic:=${SERVING_TARGET_CAPTURE_TOPIC} \
+    _serving_target_capture_cmd_topic:=${SERVING_TARGET_CAPTURE_CMD_TOPIC} \
+    _serving_target_face_image_file:=${SERVING_TARGET_FACE_IMAGE_FILE} \
+    _serving_target_face_meta_file:=${SERVING_TARGET_FACE_META_FILE} \
+    _customer_data_root:=${CUSTOMER_DATA_ROOT} \
+    _active_customer_folder_topic:=${ACTIVE_CUSTOMER_FOLDER_TOPIC} \
+    _serving_customer_state_topic:=${SERVING_CUSTOMER_STATE_TOPIC} \
     _show_debug:=false \
     _enable_voice:=${DETECTION_ENABLE_VOICE} \
     _whisper_model:=small \
