@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import difflib
 import shlex
 import subprocess
 import threading
@@ -190,19 +191,15 @@ class PersonGoalPublisher:
         self.return_table_plan_retry_interval = rospy.get_param("~return_table_plan_retry_interval", 1.0)
         self.return_table_goal_republish = rospy.get_param("~return_table_goal_republish", 2)
         self.return_table_arrive_distance = rospy.get_param("~return_table_arrive_distance", 0.35)
-        default_yolo_perception_dir = os.path.abspath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "26-WrightEagle.AI-YOLO-Perception",
-            )
-        )
+        default_yolo_perception_dir = os.path.join("..", "26-WrightEagle.AI-YOLO-Perception")
         self.table_food_check_enabled = rospy.get_param("~table_food_check_enabled", True)
         self.table_food_check_delay = rospy.get_param("~table_food_check_delay", 1.0)
-        self.table_food_detect_command = rospy.get_param("~table_food_detect_command", "")
+        self.table_food_detect_command = rospy.get_param(
+            "~table_food_detect_command",
+            "python3 realsenseinfer.py",
+        )
         self.table_food_detect_use_shell = rospy.get_param("~table_food_detect_use_shell", False)
-        self.table_food_detect_timeout = rospy.get_param("~table_food_detect_timeout", 8.0)
+        self.table_food_detect_timeout = rospy.get_param("~table_food_detect_timeout", 5.0)
         self.table_food_detect_workdir = rospy.get_param(
             "~table_food_detect_workdir",
             default_yolo_perception_dir,
@@ -303,8 +300,16 @@ class PersonGoalPublisher:
         }
         self.food_patterns = self._build_food_patterns(self.food_aliases)
         self.food_alias_lookup = self._build_food_alias_lookup(self.food_aliases)
+        self.food_alias_pairs = self._build_food_alias_pairs(self.food_aliases)
+        self.food_catalog_set = set(self.food_alias_lookup.values())
+        self.table_food_use_fuzzy_model = rospy.get_param("~table_food_use_fuzzy_model", True)
+        self.table_food_fuzzy_backend = rospy.get_param(
+            "~table_food_fuzzy_backend",
+            "reuse_order_backend",
+        )
+        self.table_food_lexical_threshold = rospy.get_param("~table_food_lexical_threshold", 0.76)
         self.food_semantic_enabled = rospy.get_param("~food_semantic_enabled", True)
-        self.food_semantic_backend = rospy.get_param("~food_semantic_backend", "auto")
+        self.food_semantic_backend = rospy.get_param("~food_semantic_backend", "ollama")
         self.food_semantic_command = rospy.get_param("~food_semantic_command", "")
         self.food_semantic_command_use_shell = rospy.get_param("~food_semantic_command_use_shell", False)
         self.food_semantic_timeout = rospy.get_param("~food_semantic_timeout", 8.0)
@@ -433,6 +438,8 @@ class PersonGoalPublisher:
         self.food_semantic_pipeline = None
         self.food_semantic_load_attempted = False
         self.food_semantic_lock = threading.Lock()
+        self.table_food_fuzzy_cache = {}
+        self.table_food_fuzzy_lock = threading.Lock()
 
         self.last_person_x = None
         self.last_person_y = None
@@ -1049,6 +1056,35 @@ class PersonGoalPublisher:
 
         return lookup
 
+    def _build_food_alias_pairs(self, alias_map):
+        pairs = []
+        if not isinstance(alias_map, dict):
+            return pairs
+
+        seen = set()
+        for canonical, aliases in alias_map.items():
+            canonical_key = self._normalize_food_name(canonical)
+            if not canonical_key:
+                continue
+
+            alias_items = [canonical_key]
+            if isinstance(aliases, list):
+                alias_items.extend(aliases)
+            elif aliases is not None:
+                alias_items.append(aliases)
+
+            for alias in alias_items:
+                alias_key = self._normalize_food_name(alias)
+                if not alias_key:
+                    continue
+                pair = (alias_key, canonical_key)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                pairs.append(pair)
+
+        return pairs
+
     def _normalize_food_name(self, name):
         if name is None:
             return ""
@@ -1066,6 +1102,141 @@ class PersonGoalPublisher:
         if key in self.food_alias_lookup:
             return self.food_alias_lookup[key]
         return key.replace(" ", "_")
+
+    def _best_lexical_food_alias_match(self, key):
+        if not key:
+            return None
+
+        best_name = None
+        best_score = 0.0
+        threshold = float(self.table_food_lexical_threshold)
+
+        for alias_key, canonical in self.food_alias_pairs:
+            score = difflib.SequenceMatcher(None, key, alias_key).ratio()
+            if key in alias_key or alias_key in key:
+                score = max(score, 0.90)
+            if score > best_score:
+                best_score = score
+                best_name = canonical
+
+        if best_name and best_score >= threshold:
+            return best_name
+        return None
+
+    def _build_table_food_fuzzy_prompt(self, detected_name):
+        known_foods = ", ".join(sorted(self.food_catalog_set))
+        return (
+            "You are a food-label matcher for a restaurant robot. "
+            "Map one detected object label to a canonical ordered-food name. "
+            "Return strict JSON only with schema: {\"name\":\"canonical_or_empty\"}. "
+            "If no match, return {\"name\":\"\"}. "
+            "Canonical names: "
+            + known_foods
+            + ". "
+            + "Detected label: "
+            + str(detected_name)
+        )
+
+    def _run_table_food_fuzzy_semantic_backend(self, prompt):
+        backend = str(self.table_food_fuzzy_backend).strip().lower()
+        if backend in (
+            "",
+            "reuse_order_backend",
+            "same_as_order",
+            "same",
+            "order",
+            "follow_order",
+        ):
+            backend = str(self.food_semantic_backend).strip().lower()
+
+        raw = ""
+        if backend in ("auto", ""):
+            raw = self._run_food_semantic_command(prompt)
+            if not raw:
+                raw = self._run_food_semantic_ollama(prompt, prompt_override=prompt)
+            if not raw:
+                raw = self._run_food_semantic_transformers(prompt, prompt_override=prompt)
+        elif backend in ("command", "cmd", "local-command"):
+            raw = self._run_food_semantic_command(prompt)
+        elif backend in ("ollama", "http", "remote"):
+            raw = self._run_food_semantic_ollama(prompt, prompt_override=prompt)
+        elif backend in ("transformers", "hf", "huggingface"):
+            raw = self._run_food_semantic_transformers(prompt, prompt_override=prompt)
+        elif backend in ("off", "none", "disabled", "false", "0"):
+            raw = ""
+        else:
+            rospy.logwarn_throttle(5.0, "Unsupported table food fuzzy backend: %s", backend)
+
+        return str(raw or "").strip()
+
+    def _parse_table_food_fuzzy_semantic_result(self, raw_text):
+        if not raw_text:
+            return None
+
+        candidates = []
+        blob = self._extract_json_blob(raw_text)
+        if blob:
+            try:
+                payload = json.loads(blob)
+                if isinstance(payload, dict):
+                    for key in ("name", "canonical", "food", "item", "match"):
+                        value = payload.get(key)
+                        if isinstance(value, str):
+                            candidates.append(value)
+                elif isinstance(payload, list):
+                    for item in payload:
+                        if isinstance(item, str):
+                            candidates.append(item)
+                        elif isinstance(item, dict):
+                            for key in ("name", "canonical", "food", "item", "match"):
+                                value = item.get(key)
+                                if isinstance(value, str):
+                                    candidates.append(value)
+            except Exception:
+                pass
+
+        if not candidates:
+            candidates.append(raw_text)
+
+        for name in candidates:
+            canonical = self._canonicalize_food_name(name)
+            if canonical and canonical in self.food_catalog_set:
+                return canonical
+
+        return None
+
+    def _best_model_food_alias_match(self, key):
+        if not self.table_food_use_fuzzy_model:
+            return None
+
+        with self.table_food_fuzzy_lock:
+            cached = self.table_food_fuzzy_cache.get(key)
+        if cached is not None:
+            return cached or None
+
+        prompt = self._build_table_food_fuzzy_prompt(key)
+        raw = self._run_table_food_fuzzy_semantic_backend(prompt)
+        matched = self._parse_table_food_fuzzy_semantic_result(raw)
+
+        with self.table_food_fuzzy_lock:
+            self.table_food_fuzzy_cache[key] = matched or ""
+
+        return matched
+
+    def _canonicalize_detected_food_name(self, name):
+        key = self._normalize_food_name(name)
+        if not key:
+            return None
+
+        direct = self.food_alias_lookup.get(key)
+        if direct:
+            return direct
+
+        lexical = self._best_lexical_food_alias_match(key)
+        if lexical:
+            return lexical
+
+        return self._best_model_food_alias_match(key)
 
     def _coerce_positive_qty(self, value):
         if isinstance(value, bool):
@@ -1285,12 +1456,12 @@ class PersonGoalPublisher:
                 rospy.logwarn("Food semantic local model load failed: %s", exc)
                 return None
 
-    def _run_food_semantic_transformers(self, text):
+    def _run_food_semantic_transformers(self, text, prompt_override=None):
         pipe = self._load_food_semantic_pipeline()
         if pipe is None:
             return ""
 
-        prompt = self._build_food_semantic_prompt(text)
+        prompt = prompt_override if prompt_override is not None else self._build_food_semantic_prompt(text)
         max_new_tokens = max(16, int(self.food_semantic_max_new_tokens))
         do_sample = float(self.food_semantic_temperature) > 1e-4
         kwargs = {
@@ -1316,7 +1487,7 @@ class PersonGoalPublisher:
             rospy.logwarn_throttle(3.0, "Food semantic local inference failed: %s", exc)
             return ""
 
-    def _run_food_semantic_ollama(self, text):
+    def _run_food_semantic_ollama(self, text, prompt_override=None):
         base_url = str(self.food_semantic_ollama_url).strip()
         if not base_url:
             return ""
@@ -1324,7 +1495,7 @@ class PersonGoalPublisher:
         endpoint = base_url.rstrip("/") + "/api/generate"
         payload = {
             "model": self.food_semantic_ollama_model,
-            "prompt": self._build_food_semantic_prompt(text),
+            "prompt": prompt_override if prompt_override is not None else self._build_food_semantic_prompt(text),
             "stream": False,
         }
         keepalive = str(self.food_semantic_ollama_keepalive).strip()
@@ -1917,7 +2088,7 @@ class PersonGoalPublisher:
     def _append_detected_food_name(self, raw_name, detected_set):
         if not isinstance(detected_set, set):
             return
-        canonical = self._canonicalize_food_name(raw_name)
+        canonical = self._canonicalize_detected_food_name(raw_name)
         if canonical:
             detected_set.add(canonical)
 
