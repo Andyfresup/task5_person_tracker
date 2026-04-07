@@ -21,6 +21,9 @@ import shlex
 import subprocess
 import threading
 import urllib.request
+from collections import deque
+
+import numpy as np
 
 import rospy
 import tf2_geometry_msgs
@@ -178,6 +181,15 @@ class PersonGoalPublisher:
             default_return_anchor_json_file,
         )
         self.return_anchor_bridge_republish = rospy.get_param("~return_anchor_bridge_republish", 2)
+        self.return_table_approach_enabled = rospy.get_param("~return_table_approach_enabled", True)
+        self.return_table_trigger_distance = rospy.get_param("~return_table_trigger_distance", 1.0)
+        self.return_table_search_radius = rospy.get_param("~return_table_search_radius", 2.2)
+        self.return_table_min_component_cells = rospy.get_param("~return_table_min_component_cells", 35)
+        self.return_table_min_elongation = rospy.get_param("~return_table_min_elongation", 1.35)
+        self.return_table_stop_offset = rospy.get_param("~return_table_stop_offset", 0.60)
+        self.return_table_plan_retry_interval = rospy.get_param("~return_table_plan_retry_interval", 1.0)
+        self.return_table_goal_republish = rospy.get_param("~return_table_goal_republish", 2)
+        self.return_table_arrive_distance = rospy.get_param("~return_table_arrive_distance", 0.35)
         self.serving_target_enabled = rospy.get_param("~serving_target_enabled", True)
         default_serving_target_snapshot_file = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "serving_target_snapshot.json")
@@ -386,6 +398,9 @@ class PersonGoalPublisher:
         self.current_needed_foods_qty = {}
         self.return_to_anchor_active = False
         self.return_anchor_goal = None
+        self.return_navigation_state = "IDLE"
+        self.return_table_goal = None
+        self.return_table_plan_attempt_time = rospy.Time(0)
         self.last_serving_target_capture_time = rospy.Time(0)
         self.gaze_stable_since = None
         self.last_gaze_stable_capture_time = rospy.Time(0)
@@ -426,6 +441,7 @@ class PersonGoalPublisher:
 
         self.active_customer_folder = folder
         self.active_customer_id = os.path.basename(folder.rstrip("/"))
+        self._load_food_orders_from_json()
         self._set_serving_customer_state("LOCKED", {"source": "active_customer_folder_topic"})
 
     def _set_serving_customer_state(self, state, extra=None):
@@ -517,6 +533,226 @@ class PersonGoalPublisher:
             except Exception:
                 pass
         return default_path
+
+    def _resolve_customer_food_order_path(self):
+        folder = self._resolve_active_customer_folder()
+        if not folder:
+            return ""
+
+        file_name = os.path.basename(str(self.food_order_json_file).strip())
+        if not file_name:
+            file_name = "food_orders.json"
+
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception as exc:
+            rospy.logwarn("Failed to prepare customer folder for food orders: %s", exc)
+            return ""
+
+        return os.path.join(folder, file_name)
+
+    def _remove_legacy_food_order_file(self, active_path):
+        legacy_path = str(self.food_order_json_file).strip()
+        if not legacy_path:
+            return
+
+        try:
+            if os.path.realpath(legacy_path) == os.path.realpath(active_path):
+                return
+        except Exception:
+            return
+
+        if not os.path.isfile(legacy_path):
+            return
+
+        try:
+            os.remove(legacy_path)
+            rospy.loginfo("Removed legacy global food order JSON: %s", legacy_path)
+        except Exception as exc:
+            rospy.logwarn("Failed to remove legacy global food order JSON (%s): %s", legacy_path, exc)
+
+    def _clear_food_orders_cache(self):
+        with self.food_order_lock:
+            self.food_order_history = []
+            self.current_needed_foods = []
+            self.current_needed_foods_qty = {}
+
+    def _load_customer_person_global_from_folder(self):
+        candidates = []
+        folder = self._resolve_active_customer_folder()
+        if folder:
+            candidates.append(os.path.join(folder, os.path.basename(self.serving_target_snapshot_json_file)))
+            candidates.append(os.path.join(folder, "serving_target_snapshot.json"))
+        candidates.append(self.serving_target_snapshot_json_file)
+
+        for path in candidates:
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fp:
+                    payload = json.load(fp)
+                person = payload.get("person_global", {})
+                gx = float(person.get("x"))
+                gy = float(person.get("y"))
+                return gx, gy
+            except Exception:
+                continue
+
+        if self.paused_person_x is not None and self.paused_person_y is not None:
+            return float(self.paused_person_x), float(self.paused_person_y)
+        return None
+
+    def _identify_nearby_counter_or_table(self, anchor_x, anchor_y):
+        if self.grid is None:
+            return None
+
+        center = self._world_to_map(anchor_x, anchor_y)
+        if center is None:
+            return None
+
+        info = self.grid.info
+        width = info.width
+        height = info.height
+        res = max(info.resolution, 1e-3)
+        data = self.grid.data
+
+        radius_cells = max(1, int(self.return_table_search_radius / res))
+        cx, cy = center
+        min_x = max(0, cx - radius_cells)
+        max_x = min(width - 1, cx + radius_cells)
+        min_y = max(0, cy - radius_cells)
+        max_y = min(height - 1, cy + radius_cells)
+
+        def _cell_to_world(mx, my):
+            wx = info.origin.position.x + (mx + 0.5) * info.resolution
+            wy = info.origin.position.y + (my + 0.5) * info.resolution
+            return wx, wy
+
+        visited = set()
+        components = []
+
+        for my in range(min_y, max_y + 1):
+            for mx in range(min_x, max_x + 1):
+                key = (mx, my)
+                if key in visited:
+                    continue
+
+                idx = my * width + mx
+                val = data[idx]
+                if val < self.occupancy_threshold:
+                    continue
+
+                q = deque([key])
+                visited.add(key)
+                cells = []
+
+                while q:
+                    ux, uy = q.popleft()
+                    cells.append((ux, uy))
+
+                    for ny in range(uy - 1, uy + 2):
+                        for nx in range(ux - 1, ux + 2):
+                            if nx < min_x or ny < min_y or nx > max_x or ny > max_y:
+                                continue
+                            nkey = (nx, ny)
+                            if nkey in visited:
+                                continue
+                            nidx = ny * width + nx
+                            nval = data[nidx]
+                            if nval >= self.occupancy_threshold:
+                                visited.add(nkey)
+                                q.append(nkey)
+
+                if len(cells) < int(self.return_table_min_component_cells):
+                    continue
+
+                pts = np.array([_cell_to_world(mx0, my0) for (mx0, my0) in cells], dtype=np.float64)
+                if pts.shape[0] < 3:
+                    continue
+
+                centroid = pts.mean(axis=0)
+                cov = np.cov(pts[:, 0], pts[:, 1])
+                if np.ndim(cov) != 2:
+                    continue
+
+                eigvals, eigvecs = np.linalg.eigh(cov)
+                order = np.argsort(eigvals)
+                minor_var = max(float(eigvals[order[0]]), 1e-6)
+                major_var = max(float(eigvals[order[1]]), minor_var)
+                major_vec = eigvecs[:, order[1]]
+
+                major_len = 4.0 * math.sqrt(major_var)
+                minor_len = 4.0 * math.sqrt(minor_var)
+                elongation = major_len / max(minor_len, 1e-3)
+                anchor_dist = math.hypot(float(centroid[0]) - anchor_x, float(centroid[1]) - anchor_y)
+
+                components.append(
+                    {
+                        "centroid": (float(centroid[0]), float(centroid[1])),
+                        "major_vec": (float(major_vec[0]), float(major_vec[1])),
+                        "major_len": float(major_len),
+                        "minor_len": float(minor_len),
+                        "elongation": float(elongation),
+                        "anchor_dist": float(anchor_dist),
+                        "cells": len(cells),
+                    }
+                )
+
+        if not components:
+            return None
+
+        elongated = [c for c in components if c["elongation"] >= float(self.return_table_min_elongation)]
+        pool = elongated if elongated else components
+        pool.sort(key=lambda c: (c["anchor_dist"], -c["elongation"], -c["cells"]))
+        return pool[0]
+
+    def _plan_table_front_goal(self, rx, ry):
+        if self.return_anchor_goal is None:
+            return None
+
+        anchor_x, anchor_y, _ = self.return_anchor_goal
+        component = self._identify_nearby_counter_or_table(anchor_x, anchor_y)
+        if component is None:
+            return None
+
+        customer = self._load_customer_person_global_from_folder()
+        if customer is None:
+            customer = (anchor_x, anchor_y)
+
+        cx, cy = component["centroid"]
+        ux, uy = component["major_vec"]
+        nx, ny = -uy, ux
+
+        vx = customer[0] - cx
+        vy = customer[1] - cy
+        if vx * nx + vy * ny < 0.0:
+            nx, ny = -nx, -ny
+
+        base_offset = float(self.return_table_stop_offset) + 0.5 * float(component["minor_len"])
+        best = None
+
+        for k in range(8):
+            dist = base_offset + 0.12 * float(k)
+            sx = cx + nx * dist
+            sy = cy + ny * dist
+            if not self._is_pose_collision_free(sx, sy):
+                continue
+            if not self._is_segment_collision_free(rx, ry, sx, sy):
+                continue
+
+            theta = math.atan2(cy - sy, cx - sx)
+            best = (sx, sy, theta)
+            break
+
+        if best is None:
+            return None
+
+        sx, sy, theta = best
+        return {
+            "goal": (sx, sy, theta),
+            "component": component,
+            "customer": customer,
+        }
 
     def _world_to_map(self, x, y):
         if self.grid is None:
@@ -1216,19 +1452,32 @@ class PersonGoalPublisher:
     def _load_food_orders_from_json(self):
         if not self.food_order_enabled:
             return
-        path = self.food_order_json_file
-        if not path or not os.path.isfile(path):
+
+        path = self._resolve_customer_food_order_path()
+        if not path:
+            self._clear_food_orders_cache()
+            rospy.logwarn_throttle(2.0, "No active customer folder; skip loading food order JSON.")
             return
+
+        if not os.path.isfile(path):
+            self._clear_food_orders_cache()
+            return
+
         try:
             with open(path, "r", encoding="utf-8") as fp:
                 payload = json.load(fp)
             history = payload.get("order_history", [])
             needed = payload.get("current_needed_foods", [])
             needed_qty = payload.get("current_needed_foods_qty", {})
+
+            loaded_history = []
+            loaded_needed = []
+            loaded_needed_qty = {}
+
             if isinstance(history, list):
-                self.food_order_history = history
+                loaded_history = history
             if isinstance(needed, list):
-                self.current_needed_foods = [str(x) for x in needed]
+                loaded_needed = [str(x) for x in needed]
             if isinstance(needed_qty, dict):
                 parsed = {}
                 for key, val in needed_qty.items():
@@ -1238,7 +1487,14 @@ class PersonGoalPublisher:
                         continue
                     if qty > 0:
                         parsed[str(key)] = qty
-                self.current_needed_foods_qty = parsed
+                loaded_needed_qty = parsed
+
+            with self.food_order_lock:
+                self.food_order_history = loaded_history
+                self.current_needed_foods = loaded_needed
+                self.current_needed_foods_qty = loaded_needed_qty
+
+            self._remove_legacy_food_order_file(path)
         except Exception as exc:
             rospy.logwarn("Failed to load food order JSON: %s", exc)
 
@@ -1414,7 +1670,7 @@ class PersonGoalPublisher:
         theta = euler_from_quaternion([qx, qy, qz, qw])[2]
         return gx, gy, theta
 
-    def _publish_return_anchor_goal(self, gx, gy, theta):
+    def _publish_manual_nav_goal(self, gx, gy, theta, reason):
         self._stop_gaze_tracking_cmd()
 
         pose_goal = PoseStamped()
@@ -1448,10 +1704,14 @@ class PersonGoalPublisher:
         self.goal_reach_since = None
 
         rospy.loginfo(
-            "Published return-to-start goal: (%.2f, %.2f)",
+            "Published %s goal: (%.2f, %.2f)",
+            str(reason),
             gx,
             gy,
         )
+
+    def _publish_return_anchor_goal(self, gx, gy, theta):
+        self._publish_manual_nav_goal(gx, gy, theta, "return-to-start")
 
     def _trigger_return_to_anchor(self):
         if not self.return_to_anchor_on_order_confirm:
@@ -1466,6 +1726,9 @@ class PersonGoalPublisher:
         gx, gy, theta = anchor
         self.return_anchor_goal = anchor
         self.return_to_anchor_active = True
+        self.return_navigation_state = "GO_TO_ANCHOR"
+        self.return_table_goal = None
+        self.return_table_plan_attempt_time = rospy.Time(0)
         self.goal_publish_paused = True
         self._set_serving_customer_state("RETURNING")
 
@@ -1474,6 +1737,65 @@ class PersonGoalPublisher:
             self._publish_return_anchor_goal(gx, gy, theta)
 
         return True
+
+    def _run_return_navigation_cycle(self):
+        if not self.return_to_anchor_active:
+            return
+        if self.return_anchor_goal is None:
+            return
+
+        pose = self._lookup_robot_pose()
+        if pose is None:
+            return
+
+        rx, ry, _ = pose
+        ax, ay, _ = self.return_anchor_goal
+        dist_to_anchor = math.hypot(rx - ax, ry - ay)
+
+        if self.return_navigation_state == "GO_TO_ANCHOR":
+            if not self.return_table_approach_enabled:
+                return
+            if dist_to_anchor > self.return_table_trigger_distance:
+                return
+
+            now = rospy.Time.now()
+            if self.return_table_plan_attempt_time != rospy.Time(0):
+                if (now - self.return_table_plan_attempt_time).to_sec() < self.return_table_plan_retry_interval:
+                    return
+            self.return_table_plan_attempt_time = now
+
+            plan = self._plan_table_front_goal(rx, ry)
+            if plan is None:
+                rospy.logwarn_throttle(1.0, "No nearby table/bar candidate found near return anchor yet.")
+                return
+
+            sx, sy, theta = plan["goal"]
+            comp = plan["component"]
+            customer = plan["customer"]
+
+            self.return_table_goal = (sx, sy, theta)
+            self.return_navigation_state = "TABLE_APPROACH"
+            self._set_serving_customer_state("TABLE_APPROACH")
+
+            republish = max(1, int(self.return_table_goal_republish))
+            for _ in range(republish):
+                self._publish_manual_nav_goal(sx, sy, theta, "table-front")
+
+            rospy.loginfo(
+                "Table/bar long-edge front goal selected (elong=%.2f, customer=(%.2f, %.2f)).",
+                comp["elongation"],
+                customer[0],
+                customer[1],
+            )
+            return
+
+        if self.return_navigation_state == "TABLE_APPROACH" and self.return_table_goal is not None:
+            sx, sy, _ = self.return_table_goal
+            dist_to_table = math.hypot(rx - sx, ry - sy)
+            if dist_to_table <= self.return_table_arrive_distance:
+                self.return_navigation_state = "AT_TABLE_FRONT"
+                self._set_serving_customer_state("AT_TABLE_FRONT")
+                rospy.loginfo("Arrived at table/bar front serving position.")
 
     def _store_food_order(self, source_text, food_summary, food_mentions):
         if not self.food_order_enabled or not food_summary:
@@ -1514,27 +1836,22 @@ class PersonGoalPublisher:
             }
 
         stored_to_file = False
-        targets = []
-        default_path = self.food_order_json_file
-        if default_path:
-            targets.append(default_path)
-
-        customer_path = self._resolve_customer_scoped_path(self.food_order_json_file)
-        if customer_path and customer_path not in targets:
-            targets.append(customer_path)
-
-        for path in targets:
+        customer_path = self._resolve_customer_food_order_path()
+        if not customer_path:
+            rospy.logwarn("No active customer folder; skip storing food order JSON.")
+        else:
             try:
-                parent = os.path.dirname(path)
+                parent = os.path.dirname(customer_path)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
-                tmp_path = path + ".tmp"
+                tmp_path = customer_path + ".tmp"
                 with open(tmp_path, "w", encoding="utf-8") as fp:
                     json.dump(payload, fp, indent=2, ensure_ascii=False)
-                os.replace(tmp_path, path)
+                os.replace(tmp_path, customer_path)
                 stored_to_file = True
+                self._remove_legacy_food_order_file(customer_path)
             except Exception as exc:
-                rospy.logwarn("Failed to write food order JSON (%s): %s", path, exc)
+                rospy.logwarn("Failed to write food order JSON (%s): %s", customer_path, exc)
 
         if self.food_order_pub is not None:
             try:
@@ -2236,6 +2553,7 @@ class PersonGoalPublisher:
         rate = rospy.Rate(self.run_rate_hz)
         try:
             while not rospy.is_shutdown():
+                self._run_return_navigation_cycle()
                 self._run_gaze_tracking_cycle()
                 if (rospy.Time.now() - self.last_person_time).to_sec() > self.person_timeout:
                     rospy.logwarn_throttle(1.0, "Person target timeout, waiting for fresh detections.")
