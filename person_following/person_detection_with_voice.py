@@ -14,6 +14,7 @@ import rospy
 import tf2_ros
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist
+from std_msgs.msg import String
 from ultralytics import YOLO
 
 try:
@@ -418,11 +419,52 @@ def main():
     )
     return_anchor_json_file = rospy.get_param("~return_anchor_json_file", default_return_anchor_file)
 
+    # Capture target face when pause-state capture request arrives.
+    serving_target_capture_topic = rospy.get_param(
+        "~serving_target_capture_topic",
+        "/person_following/serving_target_capture",
+    )
+    default_serving_target_face_image_file = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "serving_target_face.jpg")
+    )
+    serving_target_face_image_file = rospy.get_param(
+        "~serving_target_face_image_file",
+        default_serving_target_face_image_file,
+    )
+    default_serving_target_face_meta_file = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "serving_target_face_meta.json")
+    )
+    serving_target_face_meta_file = rospy.get_param(
+        "~serving_target_face_meta_file",
+        default_serving_target_face_meta_file,
+    )
+    serving_target_face_top_ratio = rospy.get_param("~serving_target_face_top_ratio", 0.50)
+    serving_target_capture_timeout = rospy.get_param("~serving_target_capture_timeout", 2.0)
+    serving_target_capture_cmd_topic = rospy.get_param(
+        "~serving_target_capture_cmd_topic",
+        "/person_following/serving_target_capture_cmd",
+    )
+
+    customer_data_root = rospy.get_param(
+        "~customer_data_root",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "service_customers")),
+    )
+    active_customer_folder_topic = rospy.get_param(
+        "~active_customer_folder_topic",
+        "/person_following/active_customer_folder",
+    )
+    serving_customer_state_topic = rospy.get_param(
+        "~serving_customer_state_topic",
+        "/person_following/serving_customer_state",
+    )
+
     cam_to_base_x = rospy.get_param("~cam_to_base_x", 0.0)
     cam_to_base_y = rospy.get_param("~cam_to_base_y", 0.0)
     cam_to_base_z = rospy.get_param("~cam_to_base_z", 0.0)
 
     pub = rospy.Publisher(person_topic, PointStamped, queue_size=1)
+    active_customer_folder_pub = rospy.Publisher(active_customer_folder_topic, String, queue_size=1, latch=True)
+    serving_customer_state_pub = rospy.Publisher(serving_customer_state_topic, String, queue_size=1, latch=True)
     return_anchor_pub = None
     if return_anchor_enabled and return_anchor_topic:
         return_anchor_pub = rospy.Publisher(return_anchor_topic, PoseStamped, queue_size=1, latch=True)
@@ -453,6 +495,13 @@ def main():
     return_anchor_recorded = False
     return_anchor_trigger_reason = None
     return_anchor_trigger_track_id = None
+    active_customer_folder = ""
+    active_customer_id = ""
+    serving_customer_state = "IDLE"
+    first_lock_face_saved = False
+    serving_target_capture_pending = False
+    serving_target_capture_request = None
+    serving_target_capture_time = None
 
     def _try_record_return_anchor(reason, track_id):
         nonlocal return_anchor_recorded
@@ -527,6 +576,255 @@ def main():
         )
         return True
 
+    def _publish_serving_customer_state(state, extra=None):
+        nonlocal serving_customer_state
+        serving_customer_state = str(state)
+
+        payload = {
+            "timestamp": rospy.Time.now().to_sec(),
+            "state": serving_customer_state,
+            "customer_id": active_customer_id,
+            "folder": active_customer_folder,
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+
+        try:
+            serving_customer_state_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+        except Exception:
+            pass
+
+        if active_customer_folder and os.path.isdir(active_customer_folder):
+            state_path = os.path.join(active_customer_folder, "customer_service_state.json")
+            try:
+                tmp_path = state_path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, state_path)
+            except Exception:
+                pass
+
+    def _ensure_customer_folder(reason, track_id):
+        nonlocal active_customer_folder
+        nonlocal active_customer_id
+
+        if active_customer_folder and os.path.isdir(active_customer_folder):
+            return active_customer_folder
+
+        ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        customer_id = "customer_%s_%s" % (ts, str(track_id))
+        folder = os.path.join(customer_data_root, customer_id)
+        try:
+            os.makedirs(os.path.join(folder, "faces"), exist_ok=True)
+        except Exception as exc:
+            rospy.logwarn("Failed to create customer folder: %s", exc)
+            return ""
+
+        active_customer_folder = folder
+        active_customer_id = customer_id
+
+        profile = {
+            "timestamp": rospy.Time.now().to_sec(),
+            "customer_id": active_customer_id,
+            "trigger": reason,
+            "track_id": int(track_id) if track_id is not None else None,
+            "folder": active_customer_folder,
+        }
+        profile_path = os.path.join(active_customer_folder, "customer_profile.json")
+        try:
+            with open(profile_path, "w", encoding="utf-8") as fp:
+                json.dump(profile, fp, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            rospy.logwarn("Failed to write customer profile: %s", exc)
+
+        try:
+            active_customer_folder_pub.publish(String(data=active_customer_folder))
+        except Exception:
+            pass
+
+        _publish_serving_customer_state("LOCKED", {"reason": reason})
+        rospy.loginfo("Created service customer folder: %s", active_customer_folder)
+        return active_customer_folder
+
+    def _face_paths(reason):
+        safe_reason = str(reason).strip().lower().replace(" ", "_")
+        if not safe_reason:
+            safe_reason = "capture"
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+        if active_customer_folder and os.path.isdir(active_customer_folder):
+            face_dir = os.path.join(active_customer_folder, "faces")
+            os.makedirs(face_dir, exist_ok=True)
+            image_path = os.path.join(face_dir, "%s_%s.jpg" % (stamp, safe_reason))
+            meta_path = os.path.join(face_dir, "%s_%s.json" % (stamp, safe_reason))
+            return image_path, meta_path
+
+        return serving_target_face_image_file, serving_target_face_meta_file
+
+    def _save_customer_face_snapshot(color_img, box, track_id, x_base, y_base, z_base, reason):
+        nonlocal serving_target_capture_pending
+        nonlocal serving_target_capture_request
+        nonlocal serving_target_capture_time
+
+        if color_img is None or box is None:
+            return False
+
+        h, w = color_img.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1 = max(0, min(x1, w - 1))
+        x2 = max(0, min(x2, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        y2 = max(0, min(y2, h - 1))
+        if x2 <= x1 or y2 <= y1:
+            rospy.logwarn("Serving target face capture failed: invalid bbox")
+            return False
+
+        top_ratio = min(0.9, max(0.2, float(serving_target_face_top_ratio)))
+        head_y2 = y1 + int((y2 - y1) * top_ratio)
+        head_y2 = max(y1 + 1, min(head_y2, y2))
+
+        face_crop = color_img[y1:head_y2, x1:x2].copy()
+        if face_crop.size == 0:
+            face_crop = color_img[y1:y2, x1:x2].copy()
+        if face_crop.size == 0:
+            rospy.logwarn("Serving target face capture failed: empty crop")
+            return False
+
+        try:
+            image_path, meta_path = _face_paths(reason)
+            image_parent = os.path.dirname(image_path)
+            if image_parent:
+                os.makedirs(image_parent, exist_ok=True)
+            ok = cv2.imwrite(image_path, face_crop)
+            if not ok:
+                rospy.logwarn("Failed to write serving target face image")
+                return False
+
+            meta = {
+                "timestamp": rospy.Time.now().to_sec(),
+                "customer_id": active_customer_id,
+                "track_id": int(track_id) if track_id is not None else None,
+                "image_path": image_path,
+                "reason": reason,
+                "bbox": {
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                },
+                "face_bbox": {
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": head_y2,
+                },
+                "person_base": {
+                    "frame_id": frame_id,
+                    "x": float(x_base),
+                    "y": float(y_base),
+                    "z": float(z_base),
+                },
+                "capture_request": serving_target_capture_request,
+            }
+
+            meta_parent = os.path.dirname(meta_path)
+            if meta_parent:
+                os.makedirs(meta_parent, exist_ok=True)
+            tmp_meta = meta_path + ".tmp"
+            with open(tmp_meta, "w", encoding="utf-8") as fp:
+                json.dump(meta, fp, indent=2, ensure_ascii=False)
+            os.replace(tmp_meta, meta_path)
+
+            serving_target_capture_pending = False
+            serving_target_capture_request = None
+            serving_target_capture_time = None
+            _publish_serving_customer_state("TRACKING", {"last_face_reason": reason})
+            rospy.loginfo("Serving target face saved: %s", image_path)
+            return True
+        except Exception as exc:
+            rospy.logwarn("Serving target face save failed: %s", exc)
+            return False
+
+    def _serving_target_capture_callback(msg):
+        nonlocal serving_target_capture_pending
+        nonlocal serving_target_capture_request
+        nonlocal serving_target_capture_time
+
+        serving_target_capture_pending = True
+        serving_target_capture_request = {
+            "stamp": msg.header.stamp.to_sec(),
+            "frame_id": msg.header.frame_id,
+            "x": msg.point.x,
+            "y": msg.point.y,
+            "z": msg.point.z,
+            "reason": "pause_enter",
+        }
+        serving_target_capture_time = rospy.Time.now()
+        rospy.loginfo(
+            "Serving target capture requested at (%.2f, %.2f) in %s",
+            msg.point.x,
+            msg.point.y,
+            msg.header.frame_id,
+        )
+
+    def _serving_target_capture_cmd_callback(msg):
+        nonlocal serving_target_capture_pending
+        nonlocal serving_target_capture_request
+        nonlocal serving_target_capture_time
+
+        raw = str(msg.data).strip()
+        if not raw:
+            return
+
+        payload = None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            payload = None
+
+        reason = "capture"
+        frame = frame_id
+        x = 0.0
+        y = 0.0
+        z = 0.0
+
+        if isinstance(payload, dict):
+            reason = str(payload.get("reason", "capture"))
+            pos = payload.get("person_global", {})
+            if isinstance(pos, dict):
+                try:
+                    x = float(pos.get("x", 0.0))
+                    y = float(pos.get("y", 0.0))
+                    z = float(pos.get("z", 0.0))
+                except Exception:
+                    x, y, z = 0.0, 0.0, 0.0
+            frame = str(payload.get("frame_id", frame_id))
+
+        serving_target_capture_pending = True
+        serving_target_capture_request = {
+            "stamp": rospy.Time.now().to_sec(),
+            "frame_id": frame,
+            "x": x,
+            "y": y,
+            "z": z,
+            "reason": reason,
+        }
+        serving_target_capture_time = rospy.Time.now()
+        rospy.loginfo("Serving target capture cmd received: reason=%s", reason)
+
+    rospy.Subscriber(
+        serving_target_capture_topic,
+        PointStamped,
+        _serving_target_capture_callback,
+        queue_size=1,
+    )
+    rospy.Subscriber(
+        serving_target_capture_cmd_topic,
+        String,
+        _serving_target_capture_cmd_callback,
+        queue_size=1,
+    )
+
     try:
         while not rospy.is_shutdown():
             if (
@@ -535,6 +833,13 @@ def main():
                 and return_anchor_trigger_reason is not None
             ):
                 _try_record_return_anchor(return_anchor_trigger_reason, return_anchor_trigger_track_id)
+
+            if serving_target_capture_pending and serving_target_capture_time is not None:
+                if (rospy.Time.now() - serving_target_capture_time).to_sec() > serving_target_capture_timeout:
+                    rospy.logwarn("Serving target face capture request timeout")
+                    serving_target_capture_pending = False
+                    serving_target_capture_request = None
+                    serving_target_capture_time = None
 
             frames = pipeline.wait_for_frames()
             aligned_frames = align.process(frames)
@@ -612,6 +917,8 @@ def main():
                     selected = choose_rightmost(raised_candidates)
                     rospy.loginfo("Locked raised-hand target: track_id=%d", selected["track_id"])
                     locked_track_id = selected["track_id"]
+                    _ensure_customer_folder("raised_hand", selected["track_id"])
+                    first_lock_face_saved = False
                     if return_anchor_trigger_reason is None:
                         return_anchor_trigger_reason = "raised_hand"
                         return_anchor_trigger_track_id = selected["track_id"]
@@ -620,6 +927,8 @@ def main():
                     selected = choose_nearest(all_candidates)
                     rospy.loginfo("Locked voice-call target (nearest): track_id=%d", selected["track_id"])
                     locked_track_id = selected["track_id"]
+                    _ensure_customer_folder("voice_call", selected["track_id"])
+                    first_lock_face_saved = False
                     if return_anchor_trigger_reason is None:
                         return_anchor_trigger_reason = "voice_call"
                         return_anchor_trigger_track_id = selected["track_id"]
@@ -679,6 +988,16 @@ def main():
             msg.point.y = y_base
             msg.point.z = z_base
             pub.publish(msg)
+
+            if (not first_lock_face_saved) and active_customer_folder:
+                if _save_customer_face_snapshot(color_img, box, track_id, x_base, y_base, z_base, "first_lock"):
+                    first_lock_face_saved = True
+
+            if serving_target_capture_pending:
+                reason = "capture"
+                if isinstance(serving_target_capture_request, dict):
+                    reason = str(serving_target_capture_request.get("reason", "capture"))
+                _save_customer_face_snapshot(color_img, box, track_id, x_base, y_base, z_base, reason)
 
             if show_debug:
                 x1, y1, x2, y2 = [int(v) for v in box]

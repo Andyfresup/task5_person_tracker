@@ -166,6 +166,52 @@ class PersonGoalPublisher:
             "~food_order_confirm_template",
             "OK, I'll get {foods} for you",
         )
+        self.return_to_anchor_on_order_confirm = rospy.get_param(
+            "~return_to_anchor_on_order_confirm",
+            True,
+        )
+        default_return_anchor_json_file = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "return_anchor.json")
+        )
+        self.return_anchor_json_file = rospy.get_param(
+            "~return_anchor_json_file",
+            default_return_anchor_json_file,
+        )
+        self.return_anchor_bridge_republish = rospy.get_param("~return_anchor_bridge_republish", 2)
+        self.serving_target_enabled = rospy.get_param("~serving_target_enabled", True)
+        default_serving_target_snapshot_file = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "serving_target_snapshot.json")
+        )
+        self.serving_target_snapshot_json_file = rospy.get_param(
+            "~serving_target_snapshot_json_file",
+            default_serving_target_snapshot_file,
+        )
+        self.serving_target_capture_topic = rospy.get_param(
+            "~serving_target_capture_topic",
+            "/person_following/serving_target_capture",
+        )
+        self.serving_target_capture_cmd_topic = rospy.get_param(
+            "~serving_target_capture_cmd_topic",
+            "/person_following/serving_target_capture_cmd",
+        )
+        self.customer_data_root = rospy.get_param(
+            "~customer_data_root",
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "service_customers")),
+        )
+        self.active_customer_folder_topic = rospy.get_param(
+            "~active_customer_folder_topic",
+            "/person_following/active_customer_folder",
+        )
+        self.serving_customer_state_topic = rospy.get_param(
+            "~serving_customer_state_topic",
+            "/person_following/serving_customer_state",
+        )
+        self.gaze_stable_face_capture_enabled = rospy.get_param(
+            "~gaze_stable_face_capture_enabled",
+            True,
+        )
+        self.gaze_stable_face_hold_time = rospy.get_param("~gaze_stable_face_hold_time", 0.8)
+        self.gaze_stable_capture_min_interval = rospy.get_param("~gaze_stable_capture_min_interval", 3.0)
         self.food_aliases = rospy.get_param(
             "~food_aliases",
             {
@@ -281,9 +327,32 @@ class PersonGoalPublisher:
         self.food_order_pub = None
         if self.food_order_publish_topic:
             self.food_order_pub = rospy.Publisher(self.food_order_publish_topic, String, queue_size=1)
+        self.serving_target_capture_pub = None
+        if self.serving_target_enabled and self.serving_target_capture_topic:
+            self.serving_target_capture_pub = rospy.Publisher(
+                self.serving_target_capture_topic,
+                PointStamped,
+                queue_size=1,
+            )
+        self.serving_target_capture_cmd_pub = None
+        if self.serving_target_enabled and self.serving_target_capture_cmd_topic:
+            self.serving_target_capture_cmd_pub = rospy.Publisher(
+                self.serving_target_capture_cmd_topic,
+                String,
+                queue_size=1,
+            )
+        self.serving_customer_state_pub = None
+        if self.serving_customer_state_topic:
+            self.serving_customer_state_pub = rospy.Publisher(
+                self.serving_customer_state_topic,
+                String,
+                queue_size=1,
+                latch=True,
+            )
 
         rospy.Subscriber(self.person_topic, PointStamped, self.person_callback, queue_size=1)
         rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback, queue_size=1)
+        rospy.Subscriber(self.active_customer_folder_topic, String, self.active_customer_folder_callback, queue_size=1)
 
         self.last_person_time = rospy.Time(0)
         self.last_goal_x = None
@@ -315,6 +384,14 @@ class PersonGoalPublisher:
         self.food_order_history = []
         self.current_needed_foods = []
         self.current_needed_foods_qty = {}
+        self.return_to_anchor_active = False
+        self.return_anchor_goal = None
+        self.last_serving_target_capture_time = rospy.Time(0)
+        self.gaze_stable_since = None
+        self.last_gaze_stable_capture_time = rospy.Time(0)
+        self.active_customer_folder = ""
+        self.active_customer_id = ""
+        self.active_customer_state = "IDLE"
         self.food_semantic_pipeline = None
         self.food_semantic_load_attempted = False
         self.food_semantic_lock = threading.Lock()
@@ -338,6 +415,108 @@ class PersonGoalPublisher:
 
     def map_callback(self, msg):
         self.grid = msg
+
+    def active_customer_folder_callback(self, msg):
+        folder = str(msg.data).strip()
+        if not folder:
+            return
+        if not os.path.isdir(folder):
+            rospy.logwarn("Active customer folder does not exist yet: %s", folder)
+            return
+
+        self.active_customer_folder = folder
+        self.active_customer_id = os.path.basename(folder.rstrip("/"))
+        self._set_serving_customer_state("LOCKED", {"source": "active_customer_folder_topic"})
+
+    def _set_serving_customer_state(self, state, extra=None):
+        self.active_customer_state = str(state)
+        payload = {
+            "timestamp": rospy.Time.now().to_sec(),
+            "state": self.active_customer_state,
+            "customer_id": self.active_customer_id,
+            "folder": self.active_customer_folder,
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+
+        if self.serving_customer_state_pub is not None:
+            try:
+                self.serving_customer_state_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+            except Exception as exc:
+                rospy.logwarn("Failed to publish serving customer state: %s", exc)
+
+        folder = self.active_customer_folder
+        if folder and os.path.isdir(folder):
+            path = os.path.join(folder, "customer_service_state.json")
+            try:
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, path)
+            except Exception as exc:
+                rospy.logwarn("Failed to write customer service state file: %s", exc)
+
+    def _select_customer_folder_for_service(self):
+        root = self.customer_data_root
+        if not root or not os.path.isdir(root):
+            return ""
+
+        priority = {
+            "RETURNING": 6,
+            "ORDERED": 5,
+            "PAUSED_ORDERING": 4,
+            "TRACKING": 3,
+            "LOCKED": 2,
+            "IDLE": 1,
+        }
+
+        best_folder = ""
+        best_score = -1
+        best_mtime = -1.0
+
+        for name in os.listdir(root):
+            folder = os.path.join(root, name)
+            if not os.path.isdir(folder):
+                continue
+
+            state = "IDLE"
+            state_file = os.path.join(folder, "customer_service_state.json")
+            if os.path.isfile(state_file):
+                try:
+                    with open(state_file, "r", encoding="utf-8") as fp:
+                        state_payload = json.load(fp)
+                    state = str(state_payload.get("state", "IDLE")).upper()
+                except Exception:
+                    state = "IDLE"
+
+            score = priority.get(state, 0)
+            mtime = os.path.getmtime(folder)
+            if score > best_score or (score == best_score and mtime > best_mtime):
+                best_score = score
+                best_mtime = mtime
+                best_folder = folder
+
+        return best_folder
+
+    def _resolve_active_customer_folder(self):
+        if self.active_customer_folder and os.path.isdir(self.active_customer_folder):
+            return self.active_customer_folder
+
+        selected = self._select_customer_folder_for_service()
+        if selected:
+            self.active_customer_folder = selected
+            self.active_customer_id = os.path.basename(selected.rstrip("/"))
+        return self.active_customer_folder
+
+    def _resolve_customer_scoped_path(self, default_path):
+        folder = self._resolve_active_customer_folder()
+        if folder:
+            try:
+                os.makedirs(folder, exist_ok=True)
+                return os.path.join(folder, os.path.basename(default_path))
+            except Exception:
+                pass
+        return default_path
 
     def _world_to_map(self, x, y):
         if self.grid is None:
@@ -1112,6 +1291,190 @@ class PersonGoalPublisher:
         except Exception:
             return "OK, I'll get %s for you" % foods_text
 
+    def _publish_serving_target_capture_request(self, gx, gy, reason):
+        if not self.serving_target_enabled:
+            return
+
+        now = rospy.Time.now()
+        if self.serving_target_capture_pub is not None:
+            req = PointStamped()
+            req.header.stamp = now
+            req.header.frame_id = self.global_frame
+            req.point.x = float(gx)
+            req.point.y = float(gy)
+            req.point.z = 0.0
+            self.serving_target_capture_pub.publish(req)
+
+        if self.serving_target_capture_cmd_pub is not None:
+            cmd_payload = {
+                "timestamp": now.to_sec(),
+                "frame_id": self.global_frame,
+                "reason": str(reason),
+                "person_global": {
+                    "x": float(gx),
+                    "y": float(gy),
+                    "z": 0.0,
+                },
+                "customer_id": self.active_customer_id,
+                "customer_folder": self.active_customer_folder,
+            }
+            try:
+                self.serving_target_capture_cmd_pub.publish(
+                    String(data=json.dumps(cmd_payload, ensure_ascii=False))
+                )
+            except Exception as exc:
+                rospy.logwarn("Failed to publish serving target capture cmd: %s", exc)
+
+    def _record_serving_target_snapshot(self, px, py, px_base, py_base):
+        if not self.serving_target_enabled:
+            return False
+
+        self._resolve_active_customer_folder()
+
+        try:
+            gx = float(px)
+            gy = float(py)
+        except Exception:
+            rospy.logwarn("Serving target snapshot skipped: invalid person coordinates")
+            return False
+
+        now = rospy.Time.now()
+        payload = {
+            "timestamp": now.to_sec(),
+            "frame_id": self.global_frame,
+            "person_global": {
+                "x": gx,
+                "y": gy,
+                "z": 0.0,
+            },
+            "current_goal": {
+                "x": self.last_goal_x,
+                "y": self.last_goal_y,
+                "theta": self.last_goal_theta,
+            },
+        }
+        if px_base is not None and py_base is not None:
+            payload["person_base"] = {
+                "frame_id": self.base_frame,
+                "x": float(px_base),
+                "y": float(py_base),
+                "z": 0.0,
+            }
+
+        payload["customer_id"] = self.active_customer_id
+        payload["customer_folder"] = self.active_customer_folder
+
+        path = self._resolve_customer_scoped_path(self.serving_target_snapshot_json_file)
+        if path:
+            try:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, path)
+            except Exception as exc:
+                rospy.logwarn("Failed to write serving target snapshot JSON: %s", exc)
+
+        self._publish_serving_target_capture_request(gx, gy, "pause_enter")
+        self._set_serving_customer_state("PAUSED_ORDERING")
+
+        self.last_serving_target_capture_time = now
+        rospy.loginfo("Serving target snapshot saved and face capture requested.")
+        return True
+
+    def _load_return_anchor_goal(self):
+        path = self.return_anchor_json_file
+        if not path or not os.path.isfile(path):
+            rospy.logwarn("Return anchor JSON not found: %s", path)
+            return None
+
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except Exception as exc:
+            rospy.logwarn("Failed to read return anchor JSON: %s", exc)
+            return None
+
+        position = payload.get("position", {})
+        orientation = payload.get("orientation", {})
+
+        try:
+            gx = float(position.get("x"))
+            gy = float(position.get("y"))
+        except Exception:
+            rospy.logwarn("Return anchor JSON missing valid position x/y")
+            return None
+
+        qx = float(orientation.get("x", 0.0))
+        qy = float(orientation.get("y", 0.0))
+        qz = float(orientation.get("z", 0.0))
+        qw = float(orientation.get("w", 1.0))
+        theta = euler_from_quaternion([qx, qy, qz, qw])[2]
+        return gx, gy, theta
+
+    def _publish_return_anchor_goal(self, gx, gy, theta):
+        self._stop_gaze_tracking_cmd()
+
+        pose_goal = PoseStamped()
+        pose_goal.header.frame_id = self.global_frame
+        pose_goal.header.stamp = rospy.Time.now()
+        pose_goal.pose.position.x = gx
+        pose_goal.pose.position.y = gy
+        pose_goal.pose.position.z = 0.0
+
+        qx, qy, qz, qw = quaternion_from_euler(0.0, 0.0, theta)
+        pose_goal.pose.orientation.x = qx
+        pose_goal.pose.orientation.y = qy
+        pose_goal.pose.orientation.z = qz
+        pose_goal.pose.orientation.w = qw
+        self.goal_pub.publish(pose_goal)
+
+        # Always publish bridge points so far_planner receives a return target.
+        waypoint = PointStamped()
+        waypoint.header = pose_goal.header
+        waypoint.point.x = gx
+        waypoint.point.y = gy
+        waypoint.point.z = 0.0
+        self.waypoint_pub.publish(waypoint)
+        self.goal_point_pub.publish(waypoint)
+
+        self.last_goal_x = gx
+        self.last_goal_y = gy
+        self.last_goal_theta = theta
+        self.last_goal_score = None
+        self.last_publish_time = rospy.Time.now()
+        self.goal_reach_since = None
+
+        rospy.loginfo(
+            "Published return-to-start goal: (%.2f, %.2f)",
+            gx,
+            gy,
+        )
+
+    def _trigger_return_to_anchor(self):
+        if not self.return_to_anchor_on_order_confirm:
+            return False
+        if self.return_to_anchor_active:
+            return True
+
+        anchor = self._load_return_anchor_goal()
+        if anchor is None:
+            return False
+
+        gx, gy, theta = anchor
+        self.return_anchor_goal = anchor
+        self.return_to_anchor_active = True
+        self.goal_publish_paused = True
+        self._set_serving_customer_state("RETURNING")
+
+        republish = max(1, int(self.return_anchor_bridge_republish))
+        for _ in range(republish):
+            self._publish_return_anchor_goal(gx, gy, theta)
+
+        return True
+
     def _store_food_order(self, source_text, food_summary, food_mentions):
         if not self.food_order_enabled or not food_summary:
             return None, False
@@ -1150,9 +1513,17 @@ class PersonGoalPublisher:
                 "order_history": self.food_order_history,
             }
 
-        path = self.food_order_json_file
-        stored_to_file = bool(path)
-        if path:
+        stored_to_file = False
+        targets = []
+        default_path = self.food_order_json_file
+        if default_path:
+            targets.append(default_path)
+
+        customer_path = self._resolve_customer_scoped_path(self.food_order_json_file)
+        if customer_path and customer_path not in targets:
+            targets.append(customer_path)
+
+        for path in targets:
             try:
                 parent = os.path.dirname(path)
                 if parent:
@@ -1161,9 +1532,9 @@ class PersonGoalPublisher:
                 with open(tmp_path, "w", encoding="utf-8") as fp:
                     json.dump(payload, fp, indent=2, ensure_ascii=False)
                 os.replace(tmp_path, path)
+                stored_to_file = True
             except Exception as exc:
-                stored_to_file = False
-                rospy.logwarn("Failed to write food order JSON: %s", exc)
+                rospy.logwarn("Failed to write food order JSON (%s): %s", path, exc)
 
         if self.food_order_pub is not None:
             try:
@@ -1377,6 +1748,8 @@ class PersonGoalPublisher:
         if not text:
             return False
 
+        self._resolve_active_customer_folder()
+
         rospy.loginfo("Pause reply recognized: %s", text)
         if self.pause_reply_pub is not None:
             self.pause_reply_pub.publish(String(data=text))
@@ -1390,9 +1763,11 @@ class PersonGoalPublisher:
             rospy.loginfo("Extracted requested foods: %s", summary_text)
 
             if stored_to_file and payload is not None:
+                self._set_serving_customer_state("ORDERED")
                 confirm_text = self._build_food_order_confirmation_text(payload)
                 if confirm_text:
                     self._announce_text_prompt(confirm_text, force=True)
+                self._trigger_return_to_anchor()
 
             return True
 
@@ -1613,25 +1988,75 @@ class PersonGoalPublisher:
         self.search_cmd_pub.publish(cmd)
         self.gaze_cmd_active = True
 
+    def _maybe_capture_gaze_stable_face(self, px_base, py_base, rx, ry, robot_yaw):
+        if not self.gaze_stable_face_capture_enabled:
+            self.gaze_stable_since = None
+            return
+
+        heading = math.atan2(py_base, max(px_base, 1e-4))
+        dist = math.hypot(px_base, py_base)
+        heading_ok = abs(heading) <= math.radians(max(self.gaze_yaw_deadband_deg, 2.0))
+        dist_ok = abs(dist - self.gaze_target_distance) <= max(self.gaze_distance_tolerance, 0.08)
+
+        now = rospy.Time.now()
+        if heading_ok and dist_ok:
+            if self.gaze_stable_since is None:
+                self.gaze_stable_since = now
+                return
+
+            held = (now - self.gaze_stable_since).to_sec()
+            if held < self.gaze_stable_face_hold_time:
+                return
+
+            if self.last_gaze_stable_capture_time != rospy.Time(0):
+                if (now - self.last_gaze_stable_capture_time).to_sec() < self.gaze_stable_capture_min_interval:
+                    return
+
+            gx = rx + px_base * math.cos(robot_yaw) - py_base * math.sin(robot_yaw)
+            gy = ry + px_base * math.sin(robot_yaw) + py_base * math.cos(robot_yaw)
+            self._publish_serving_target_capture_request(gx, gy, "gaze_stable")
+            self.last_gaze_stable_capture_time = now
+            self.gaze_stable_since = now
+            rospy.loginfo("Gaze stable, requested target face capture.")
+            return
+
+        self.gaze_stable_since = None
+
     def _run_gaze_tracking_cycle(self):
+        if self.return_to_anchor_active:
+            self.gaze_stable_since = None
+            self._stop_gaze_tracking_cmd()
+            return
+
         if not (self.gaze_tracking_on_pause and self.goal_publish_paused):
+            self.gaze_stable_since = None
             return
 
         if self.latest_person_base_time == rospy.Time(0):
+            self.gaze_stable_since = None
             self._stop_gaze_tracking_cmd()
             return
 
         if (rospy.Time.now() - self.latest_person_base_time).to_sec() > self.gaze_person_timeout:
+            self.gaze_stable_since = None
             self._stop_gaze_tracking_cmd()
             return
 
         pose = self._lookup_robot_pose()
         if pose is None:
+            self.gaze_stable_since = None
             self._stop_gaze_tracking_cmd()
             return
 
         rx, ry, robot_yaw = pose
         self._publish_gaze_tracking_cmd(
+            self.latest_person_base_x,
+            self.latest_person_base_y,
+            rx,
+            ry,
+            robot_yaw,
+        )
+        self._maybe_capture_gaze_stable_face(
             self.latest_person_base_x,
             self.latest_person_base_y,
             rx,
@@ -1652,6 +2077,7 @@ class PersonGoalPublisher:
             if moved >= self.person_reacquire_distance:
                 self.goal_publish_paused = False
                 self.goal_reach_since = None
+                self._set_serving_customer_state("TRACKING")
                 rospy.loginfo("Person moved globally %.2fm, resume goal publishing.", moved)
                 return False
 
@@ -1676,6 +2102,7 @@ class PersonGoalPublisher:
                 ):
                     self.goal_publish_paused = False
                     self.goal_reach_since = None
+                    self._set_serving_customer_state("TRACKING")
                     rospy.loginfo(
                         "Person moved near-field (dx=%.2f, dy=%.2f, dtheta=%.1fdeg), resume goal publishing.",
                         forward_shift,
@@ -1710,6 +2137,7 @@ class PersonGoalPublisher:
                     dist_to_goal,
                     held,
                 )
+                self._record_serving_target_snapshot(px, py, px_base, py_base)
                 self._announce_pause_prompt()
                 self._trigger_pause_reply_listen()
                 return True
@@ -1721,6 +2149,10 @@ class PersonGoalPublisher:
     def person_callback(self, msg):
         now = rospy.Time.now()
         self.last_person_time = now
+
+        if self.return_to_anchor_active:
+            self._stop_gaze_tracking_cmd()
+            return
 
         try:
             transform = self.tf_buffer.lookup_transform(
