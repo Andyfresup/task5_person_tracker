@@ -12,13 +12,22 @@ Behavior:
 - Built-in bridge publishes PointStamped to /way_point and /goal_point.
 """
 
+import importlib.util
+import json
 import math
+import os
+import re
+import shlex
+import subprocess
+import threading
+import urllib.request
 
 import rospy
 import tf2_geometry_msgs
 import tf2_ros
 from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 
 
@@ -82,6 +91,156 @@ class PersonGoalPublisher:
         # Run loop rate controls gaze-tracking and obstacle checks frequency.
         self.run_rate_hz = rospy.get_param("~run_rate_hz", 20.0)
 
+        # Voice prompt when entering pause-gaze state.
+        self.pause_prompt_enabled = rospy.get_param("~pause_prompt_enabled", True)
+        self.pause_prompt_text = rospy.get_param("~pause_prompt_text", "What do you want")
+        self.pause_prompt_topic = rospy.get_param("~pause_prompt_topic", "")
+        self.pause_prompt_command = rospy.get_param("~pause_prompt_command", "")
+        self.pause_prompt_use_shell = rospy.get_param("~pause_prompt_use_shell", False)
+        self.pause_prompt_cooldown = rospy.get_param("~pause_prompt_cooldown", 2.0)
+        default_speech_module_file = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "26-WrightEagle.AI-Speech",
+                "src",
+                "tts",
+                "synthesizer.py",
+            )
+        )
+        self.pause_prompt_use_speech_module = rospy.get_param("~pause_prompt_use_speech_module", False)
+        self.pause_prompt_speech_module_file = rospy.get_param(
+            "~pause_prompt_speech_module_file",
+            default_speech_module_file,
+        )
+        self.pause_prompt_speech_class = rospy.get_param("~pause_prompt_speech_class", "TTS")
+
+        # Optional one-shot ASR after pause prompt, reusing AI-Speech ASR module.
+        default_asr_module_file = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "26-WrightEagle.AI-Speech",
+                "src",
+                "asr",
+                "vad-whisper.py",
+            )
+        )
+        self.pause_reply_listen_enabled = rospy.get_param("~pause_reply_listen_enabled", True)
+        self.pause_reply_use_speech_module = rospy.get_param("~pause_reply_use_speech_module", True)
+        self.pause_reply_speech_module_file = rospy.get_param(
+            "~pause_reply_speech_module_file",
+            default_asr_module_file,
+        )
+        self.pause_reply_speech_class = rospy.get_param("~pause_reply_speech_class", "SpeechRecognizer")
+        self.pause_reply_mic_name = rospy.get_param("~pause_reply_mic_name", "Newmine")
+        self.pause_reply_timeout = rospy.get_param("~pause_reply_timeout", 6.0)
+        self.pause_reply_start_delay = rospy.get_param("~pause_reply_start_delay", 1.2)
+        self.pause_reply_min_audio_sec = rospy.get_param("~pause_reply_min_audio_sec", 0.15)
+        self.pause_reply_language = rospy.get_param("~pause_reply_language", "en")
+        self.pause_reply_beam_size = rospy.get_param("~pause_reply_beam_size", 5)
+        self.pause_reply_cooldown = rospy.get_param("~pause_reply_cooldown", 2.0)
+        self.pause_reply_topic = rospy.get_param("~pause_reply_topic", "/person_following/pause_reply_text")
+        self.pause_reply_reask_on_unrecognized = rospy.get_param("~pause_reply_reask_on_unrecognized", True)
+        self.pause_reply_reask_text = rospy.get_param(
+            "~pause_reply_reask_text",
+            "Can I beg you a pardon?",
+        )
+        self.pause_reply_reask_max_attempts = rospy.get_param("~pause_reply_reask_max_attempts", 1)
+        self.pause_reply_reask_listen_delay = rospy.get_param("~pause_reply_reask_listen_delay", 1.1)
+
+        # Parse recognized reply text for food items and persist to JSON.
+        self.food_order_enabled = rospy.get_param("~food_order_enabled", True)
+        default_food_order_json_file = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "food_orders.json")
+        )
+        self.food_order_json_file = rospy.get_param("~food_order_json_file", default_food_order_json_file)
+        self.food_order_publish_topic = rospy.get_param(
+            "~food_order_publish_topic",
+            "/person_following/food_order_json",
+        )
+        self.food_order_confirm_enabled = rospy.get_param("~food_order_confirm_enabled", True)
+        self.food_order_confirm_template = rospy.get_param(
+            "~food_order_confirm_template",
+            "OK, I'll get {foods} for you",
+        )
+        self.food_aliases = rospy.get_param(
+            "~food_aliases",
+            {
+                "water": ["water", "bottle of water"],
+                "coke": ["coke", "cola", "coca cola"],
+                "juice": ["juice", "orange juice", "apple juice"],
+                "coffee": ["coffee", "latte", "americano", "cappuccino"],
+                "tea": ["tea", "black tea", "green tea", "milk tea"],
+                "burger": ["burger", "hamburger", "cheeseburger"],
+                "pizza": ["pizza"],
+                "sandwich": ["sandwich"],
+                "fried_rice": ["fried rice"],
+                "noodles": ["noodles", "ramen"],
+                "dumplings": ["dumpling", "dumplings"],
+                "pasta": ["pasta", "spaghetti"],
+                "fries": ["fries", "french fries", "chips"],
+                "salad": ["salad"],
+                "soup": ["soup"],
+            },
+        )
+        self.food_qty_word_map = {
+            "a": 1,
+            "an": 1,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+        self.food_qty_bridge_tokens = {
+            "x",
+            "of",
+            "piece",
+            "pieces",
+            "plate",
+            "plates",
+            "bowl",
+            "bowls",
+            "cup",
+            "cups",
+            "glass",
+            "glasses",
+            "bottle",
+            "bottles",
+            "can",
+            "cans",
+            "order",
+            "orders",
+            "portion",
+            "portions",
+        }
+        self.food_patterns = self._build_food_patterns(self.food_aliases)
+        self.food_alias_lookup = self._build_food_alias_lookup(self.food_aliases)
+        self.food_semantic_enabled = rospy.get_param("~food_semantic_enabled", True)
+        self.food_semantic_backend = rospy.get_param("~food_semantic_backend", "auto")
+        self.food_semantic_command = rospy.get_param("~food_semantic_command", "")
+        self.food_semantic_command_use_shell = rospy.get_param("~food_semantic_command_use_shell", False)
+        self.food_semantic_timeout = rospy.get_param("~food_semantic_timeout", 8.0)
+        self.food_semantic_model_path = rospy.get_param("~food_semantic_model_path", "")
+        self.food_semantic_transformers_task = rospy.get_param(
+            "~food_semantic_transformers_task",
+            "text-generation",
+        )
+        self.food_semantic_device = rospy.get_param("~food_semantic_device", -1)
+        self.food_semantic_max_new_tokens = rospy.get_param("~food_semantic_max_new_tokens", 120)
+        self.food_semantic_temperature = rospy.get_param("~food_semantic_temperature", 0.0)
+        self.food_semantic_ollama_url = rospy.get_param("~food_semantic_ollama_url", "")
+        self.food_semantic_ollama_model = rospy.get_param("~food_semantic_ollama_model", "llama3.2:1b")
+        self.food_semantic_ollama_keepalive = rospy.get_param("~food_semantic_ollama_keepalive", "5m")
+
         # Candidate sampling and scoring.
         self.min_candidate_radius = rospy.get_param("~min_candidate_radius", 0.9)
         self.max_candidate_radius = rospy.get_param("~max_candidate_radius", 1.6)
@@ -113,6 +272,15 @@ class PersonGoalPublisher:
         self.waypoint_pub = rospy.Publisher(self.waypoint_topic, PointStamped, queue_size=1)
         self.goal_point_pub = rospy.Publisher(self.goal_point_topic, PointStamped, queue_size=1)
         self.search_cmd_pub = rospy.Publisher(self.search_cmd_topic, Twist, queue_size=1)
+        self.pause_prompt_pub = None
+        if self.pause_prompt_topic:
+            self.pause_prompt_pub = rospy.Publisher(self.pause_prompt_topic, String, queue_size=1)
+        self.pause_reply_pub = None
+        if self.pause_reply_topic:
+            self.pause_reply_pub = rospy.Publisher(self.pause_reply_topic, String, queue_size=1)
+        self.food_order_pub = None
+        if self.food_order_publish_topic:
+            self.food_order_pub = rospy.Publisher(self.food_order_publish_topic, String, queue_size=1)
 
         rospy.Subscriber(self.person_topic, PointStamped, self.person_callback, queue_size=1)
         rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback, queue_size=1)
@@ -134,6 +302,22 @@ class PersonGoalPublisher:
         self.latest_person_base_x = None
         self.latest_person_base_y = None
         self.latest_person_base_time = rospy.Time(0)
+        self.last_pause_prompt_time = rospy.Time(0)
+        self.pause_speech_tts = None
+        self.pause_speech_load_attempted = False
+        self.pause_speech_lock = threading.Lock()
+        self.pause_speech_asr = None
+        self.pause_asr_load_attempted = False
+        self.pause_asr_lock = threading.Lock()
+        self.pause_reply_thread = None
+        self.last_pause_reply_time = rospy.Time(0)
+        self.food_order_lock = threading.Lock()
+        self.food_order_history = []
+        self.current_needed_foods = []
+        self.current_needed_foods_qty = {}
+        self.food_semantic_pipeline = None
+        self.food_semantic_load_attempted = False
+        self.food_semantic_lock = threading.Lock()
 
         self.last_person_x = None
         self.last_person_y = None
@@ -141,6 +325,7 @@ class PersonGoalPublisher:
         self.person_heading = None
 
         self.grid = None
+        self._load_food_orders_from_json()
 
         rospy.loginfo(
             "person_goal_publisher started: person=%s goal=%s waypoint=%s goal_point=%s map=%s",
@@ -365,6 +550,981 @@ class PersonGoalPublisher:
         self.search_cmd_pub.publish(Twist())
         self.gaze_cmd_active = False
 
+    def _build_food_patterns(self, alias_map):
+        patterns = []
+        if not isinstance(alias_map, dict):
+            return patterns
+
+        for canonical, aliases in alias_map.items():
+            key = str(canonical).strip().lower()
+            if not key:
+                continue
+            names = [key]
+            if isinstance(aliases, list):
+                for item in aliases:
+                    token = str(item).strip().lower()
+                    if token:
+                        names.append(token)
+            elif aliases is not None:
+                token = str(aliases).strip().lower()
+                if token:
+                    names.append(token)
+
+            seen = set()
+            for name in names:
+                if name in seen:
+                    continue
+                seen.add(name)
+                patterns.append(
+                    (
+                        key,
+                        name,
+                        re.compile(r"\\b" + re.escape(name) + r"\\b"),
+                    )
+                )
+
+        # Match longer aliases first (e.g. "fried rice" before "rice").
+        patterns.sort(key=lambda x: len(x[1]), reverse=True)
+        return patterns
+
+    def _build_food_alias_lookup(self, alias_map):
+        lookup = {}
+        if not isinstance(alias_map, dict):
+            return lookup
+
+        for canonical, aliases in alias_map.items():
+            canonical_key = self._normalize_food_name(canonical)
+            if not canonical_key:
+                continue
+            lookup[canonical_key] = canonical_key
+
+            alias_list = []
+            if isinstance(aliases, list):
+                alias_list = aliases
+            elif aliases is not None:
+                alias_list = [aliases]
+
+            for alias in alias_list:
+                alias_key = self._normalize_food_name(alias)
+                if alias_key:
+                    lookup[alias_key] = canonical_key
+
+        return lookup
+
+    def _normalize_food_name(self, name):
+        if name is None:
+            return ""
+        text = str(name).strip().lower()
+        text = re.sub(r"[^a-z0-9_\\s]", " ", text)
+        text = re.sub(r"\\s+", " ", text).strip()
+        if text in ("none", "null"):
+            return ""
+        return text
+
+    def _canonicalize_food_name(self, name):
+        key = self._normalize_food_name(name)
+        if not key:
+            return None
+        if key in self.food_alias_lookup:
+            return self.food_alias_lookup[key]
+        return key.replace(" ", "_")
+
+    def _coerce_positive_qty(self, value):
+        if isinstance(value, bool):
+            return 1
+        if isinstance(value, (int, float)):
+            qty = int(value)
+            return qty if qty > 0 else 1
+
+        text = str(value).strip().lower()
+        if not text:
+            return 1
+        if text in self.food_qty_word_map:
+            return int(self.food_qty_word_map[text])
+        if text.startswith("x") and text[1:].isdigit():
+            qty = int(text[1:])
+            return qty if qty > 0 else 1
+        if text.isdigit():
+            qty = int(text)
+            return qty if qty > 0 else 1
+        return 1
+
+    def _build_food_semantic_prompt(self, text):
+        known_foods = ", ".join(sorted(self.food_aliases.keys()))
+        return (
+            "You are an English food-order information extractor. "
+            "Input sentence is in English. "
+            "Return strict JSON only, with no extra text. "
+            "Schema: {\"items\":[{\"name\":\"food_name\",\"qty\":1}]}. "
+            "qty must be integer >= 1. If quantity is missing, use 1. "
+            "Do not invent items that are not mentioned. "
+            "Prefer canonical names from: "
+            + known_foods
+            + ". "
+            + "Example: 'I want two cokes and a burger' -> "
+            + "{\"items\":[{\"name\":\"coke\",\"qty\":2},{\"name\":\"burger\",\"qty\":1}]}. "
+            + "Sentence: "
+            + text
+        )
+
+    def _extract_json_blob(self, text):
+        if not text:
+            return ""
+
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z0-9_-]*\\s*", "", raw)
+            raw = re.sub(r"\\s*```$", "", raw)
+            raw = raw.strip()
+
+        candidates = [raw]
+        obj_start = raw.find("{")
+        obj_end = raw.rfind("}")
+        if obj_start >= 0 and obj_end > obj_start:
+            candidates.append(raw[obj_start : obj_end + 1])
+
+        arr_start = raw.find("[")
+        arr_end = raw.rfind("]")
+        if arr_start >= 0 and arr_end > arr_start:
+            candidates.append(raw[arr_start : arr_end + 1])
+
+        for candidate in candidates:
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                continue
+        return ""
+
+    def _parse_semantic_food_json(self, raw_text):
+        blob = self._extract_json_blob(raw_text)
+        if not blob:
+            return {}, []
+
+        try:
+            payload = json.loads(blob)
+        except Exception:
+            return {}, []
+
+        if isinstance(payload, dict):
+            items = (
+                payload.get("items")
+                or payload.get("foods")
+                or payload.get("orders")
+                or payload.get("result")
+                or []
+            )
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            items = []
+
+        summary = {}
+        mentions = []
+        for item in items:
+            raw_name = None
+            raw_qty = 1
+            if isinstance(item, str):
+                raw_name = item
+            elif isinstance(item, dict):
+                raw_name = (
+                    item.get("name")
+                    or item.get("food")
+                    or item.get("item")
+                    or item.get("dish")
+                )
+                raw_qty = (
+                    item.get("qty")
+                    or item.get("quantity")
+                    or item.get("count")
+                    or 1
+                )
+
+            canonical = self._canonicalize_food_name(raw_name)
+            if not canonical:
+                continue
+
+            qty = self._coerce_positive_qty(raw_qty)
+            summary[canonical] = summary.get(canonical, 0) + qty
+            mentions.append(
+                {
+                    "name": canonical,
+                    "alias": self._normalize_food_name(raw_name),
+                    "qty": qty,
+                    "source": "semantic",
+                }
+            )
+
+        return summary, mentions
+
+    def _run_food_semantic_command(self, text):
+        template = self.food_semantic_command
+        if not template:
+            return ""
+
+        timeout = max(0.5, float(self.food_semantic_timeout))
+        use_shell = bool(self.food_semantic_command_use_shell)
+
+        try:
+            if "{text}" in template:
+                command = template.replace("{text}", text)
+                if use_shell:
+                    proc = subprocess.run(
+                        command,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                else:
+                    proc = subprocess.run(
+                        shlex.split(command),
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+            else:
+                if use_shell:
+                    proc = subprocess.run(
+                        template,
+                        shell=True,
+                        input=text,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+                else:
+                    proc = subprocess.run(
+                        shlex.split(template),
+                        input=text,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                    )
+
+            if proc.returncode != 0:
+                rospy.logwarn_throttle(
+                    3.0,
+                    "Food semantic command returned code %d",
+                    proc.returncode,
+                )
+            return (proc.stdout or "").strip()
+        except Exception as exc:
+            rospy.logwarn_throttle(3.0, "Food semantic command failed: %s", exc)
+            return ""
+
+    def _load_food_semantic_pipeline(self):
+        with self.food_semantic_lock:
+            if self.food_semantic_pipeline is not None:
+                return self.food_semantic_pipeline
+            if self.food_semantic_load_attempted:
+                return None
+
+            self.food_semantic_load_attempted = True
+            model_path = self.food_semantic_model_path
+            if not model_path:
+                return None
+            if not os.path.isdir(model_path):
+                rospy.logwarn("Food semantic model path not found: %s", model_path)
+                return None
+
+            try:
+                from transformers import pipeline
+
+                self.food_semantic_pipeline = pipeline(
+                    self.food_semantic_transformers_task,
+                    model=model_path,
+                    tokenizer=model_path,
+                    device=int(self.food_semantic_device),
+                )
+                rospy.loginfo(
+                    "Food semantic local model loaded: %s (%s)",
+                    model_path,
+                    self.food_semantic_transformers_task,
+                )
+                return self.food_semantic_pipeline
+            except Exception as exc:
+                rospy.logwarn("Food semantic local model load failed: %s", exc)
+                return None
+
+    def _run_food_semantic_transformers(self, text):
+        pipe = self._load_food_semantic_pipeline()
+        if pipe is None:
+            return ""
+
+        prompt = self._build_food_semantic_prompt(text)
+        max_new_tokens = max(16, int(self.food_semantic_max_new_tokens))
+        do_sample = float(self.food_semantic_temperature) > 1e-4
+        kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+        }
+        if do_sample:
+            kwargs["temperature"] = max(0.1, float(self.food_semantic_temperature))
+
+        try:
+            outputs = pipe(prompt, **kwargs)
+            if not outputs:
+                return ""
+            item = outputs[0]
+            if isinstance(item, dict):
+                raw = item.get("generated_text") or item.get("summary_text") or ""
+            else:
+                raw = str(item)
+            if raw.startswith(prompt):
+                raw = raw[len(prompt) :]
+            return raw.strip()
+        except Exception as exc:
+            rospy.logwarn_throttle(3.0, "Food semantic local inference failed: %s", exc)
+            return ""
+
+    def _run_food_semantic_ollama(self, text):
+        base_url = str(self.food_semantic_ollama_url).strip()
+        if not base_url:
+            return ""
+
+        endpoint = base_url.rstrip("/") + "/api/generate"
+        payload = {
+            "model": self.food_semantic_ollama_model,
+            "prompt": self._build_food_semantic_prompt(text),
+            "stream": False,
+        }
+        keepalive = str(self.food_semantic_ollama_keepalive).strip()
+        if keepalive:
+            payload["keep_alive"] = keepalive
+
+        timeout = max(0.5, float(self.food_semantic_timeout))
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            result = json.loads(raw)
+            text_out = result.get("response", "")
+            return str(text_out).strip()
+        except Exception as exc:
+            rospy.logwarn_throttle(3.0, "Food semantic ollama request failed: %s", exc)
+            return ""
+
+    def _extract_food_items_semantic(self, text):
+        if not self.food_semantic_enabled:
+            return {}, []
+
+        backend = str(self.food_semantic_backend).strip().lower()
+        raw = ""
+
+        if backend in ("auto", ""):
+            raw = self._run_food_semantic_command(text)
+            if not raw:
+                raw = self._run_food_semantic_ollama(text)
+            if not raw:
+                raw = self._run_food_semantic_transformers(text)
+        elif backend in ("command", "cmd", "local-command"):
+            raw = self._run_food_semantic_command(text)
+        elif backend in ("ollama", "http", "remote"):
+            raw = self._run_food_semantic_ollama(text)
+        elif backend in ("transformers", "hf", "huggingface"):
+            raw = self._run_food_semantic_transformers(text)
+        else:
+            rospy.logwarn_throttle(5.0, "Unsupported food semantic backend: %s", backend)
+
+        if not raw:
+            return {}, []
+
+        return self._parse_semantic_food_json(raw)
+
+    def _extract_food_items(self, text):
+        if not text:
+            return {}, []
+
+        semantic_summary, semantic_mentions = self._extract_food_items_semantic(text)
+        if semantic_summary:
+            return semantic_summary, semantic_mentions
+
+        normalized = re.sub(r"[^a-z0-9\\s]", " ", text.lower())
+        normalized = re.sub(r"\\s+", " ", normalized).strip()
+        if not normalized:
+            return {}, []
+
+        token_matches = list(re.finditer(r"\\S+", normalized))
+        tokens = [m.group(0) for m in token_matches]
+
+        def _qty_from_token(token):
+            tk = token.strip().lower()
+            if not tk:
+                return None
+            if tk.startswith("x") and len(tk) > 1 and tk[1:].isdigit():
+                return max(1, int(tk[1:]))
+            if tk.isdigit():
+                return max(1, int(tk))
+            return self.food_qty_word_map.get(tk)
+
+        def _qty_near_span(s0, s1):
+            left_idx = None
+            right_idx = None
+            for idx, tm in enumerate(token_matches):
+                if tm.end() <= s0:
+                    continue
+                if tm.start() >= s1:
+                    continue
+                if left_idx is None:
+                    left_idx = idx
+                right_idx = idx
+
+            if left_idx is None or right_idx is None:
+                return 1
+
+            # Check tokens before alias, nearest first: "two burgers".
+            for idx in range(left_idx - 1, max(-1, left_idx - 6), -1):
+                tk = tokens[idx]
+                qty = _qty_from_token(tk)
+                if qty is not None:
+                    return qty
+                if tk in self.food_qty_bridge_tokens:
+                    continue
+                break
+
+            # Check tokens after alias: "burger x2" or "burger 2".
+            for idx in range(right_idx + 1, min(len(tokens), right_idx + 6)):
+                tk = tokens[idx]
+                qty = _qty_from_token(tk)
+                if qty is not None:
+                    return qty
+                if tk in self.food_qty_bridge_tokens:
+                    continue
+                break
+
+            return 1
+
+        mentions = []
+        used_spans = []
+        for canonical, alias, pattern in self.food_patterns:
+            for match in pattern.finditer(normalized):
+                s0, s1 = match.span()
+                overlap = False
+                for u0, u1 in used_spans:
+                    if not (s1 <= u0 or s0 >= u1):
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                used_spans.append((s0, s1))
+
+                qty = _qty_near_span(s0, s1)
+                mentions.append(
+                    {
+                        "name": canonical,
+                        "alias": alias,
+                        "qty": int(qty),
+                        "source": "keyword",
+                    }
+                )
+
+        summary = {}
+        for m in mentions:
+            name = m["name"]
+            qty = max(1, int(m.get("qty", 1)))
+            summary[name] = summary.get(name, 0) + qty
+
+        return summary, mentions
+
+    def _load_food_orders_from_json(self):
+        if not self.food_order_enabled:
+            return
+        path = self.food_order_json_file
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            history = payload.get("order_history", [])
+            needed = payload.get("current_needed_foods", [])
+            needed_qty = payload.get("current_needed_foods_qty", {})
+            if isinstance(history, list):
+                self.food_order_history = history
+            if isinstance(needed, list):
+                self.current_needed_foods = [str(x) for x in needed]
+            if isinstance(needed_qty, dict):
+                parsed = {}
+                for key, val in needed_qty.items():
+                    try:
+                        qty = int(val)
+                    except Exception:
+                        continue
+                    if qty > 0:
+                        parsed[str(key)] = qty
+                self.current_needed_foods_qty = parsed
+        except Exception as exc:
+            rospy.logwarn("Failed to load food order JSON: %s", exc)
+
+    def _format_foods_with_qty_for_speech(self, foods_with_qty):
+        if not isinstance(foods_with_qty, list):
+            return ""
+
+        parts = []
+        for item in foods_with_qty:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip().replace("_", " ")
+            if not name:
+                continue
+            qty = self._coerce_positive_qty(item.get("qty", 1))
+            if qty > 1:
+                parts.append("%d %s" % (qty, name))
+            else:
+                parts.append(name)
+
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            return parts[0] + " and " + parts[1]
+        return ", ".join(parts[:-1]) + ", and " + parts[-1]
+
+    def _build_food_order_confirmation_text(self, payload):
+        if not self.food_order_confirm_enabled:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+
+        entry = payload.get("last_entry", {})
+        foods_with_qty = []
+        if isinstance(entry, dict):
+            foods_with_qty = entry.get("foods_with_qty", [])
+
+        foods_text = self._format_foods_with_qty_for_speech(foods_with_qty)
+        if not foods_text:
+            return ""
+
+        template = str(self.food_order_confirm_template).strip()
+        if not template:
+            template = "OK, I'll get {foods} for you"
+
+        try:
+            return template.format(foods=foods_text)
+        except Exception:
+            return "OK, I'll get %s for you" % foods_text
+
+    def _store_food_order(self, source_text, food_summary, food_mentions):
+        if not self.food_order_enabled or not food_summary:
+            return None, False
+
+        now = rospy.Time.now().to_sec()
+        ts = rospy.Time.from_sec(now).to_sec()
+        foods_with_qty = []
+        for name in sorted(food_summary.keys()):
+            foods_with_qty.append({"name": name, "qty": int(food_summary[name])})
+
+        entry = {
+            "timestamp": ts,
+            "source": "pause_reply",
+            "recognized_text": source_text,
+            "foods": [item["name"] for item in foods_with_qty],
+            "foods_with_qty": foods_with_qty,
+            "food_mentions": food_mentions,
+        }
+
+        with self.food_order_lock:
+            self.food_order_history.append(entry)
+            if len(self.food_order_history) > 200:
+                self.food_order_history = self.food_order_history[-200:]
+
+            for item in food_summary.keys():
+                if item not in self.current_needed_foods:
+                    self.current_needed_foods.append(item)
+                self.current_needed_foods_qty[item] = (
+                    int(self.current_needed_foods_qty.get(item, 0)) + int(food_summary[item])
+                )
+
+            payload = {
+                "current_needed_foods": self.current_needed_foods,
+                "current_needed_foods_qty": self.current_needed_foods_qty,
+                "last_entry": entry,
+                "order_history": self.food_order_history,
+            }
+
+        path = self.food_order_json_file
+        stored_to_file = bool(path)
+        if path:
+            try:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                tmp_path = path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp, indent=2, ensure_ascii=False)
+                os.replace(tmp_path, path)
+            except Exception as exc:
+                stored_to_file = False
+                rospy.logwarn("Failed to write food order JSON: %s", exc)
+
+        if self.food_order_pub is not None:
+            try:
+                self.food_order_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+            except Exception as exc:
+                rospy.logwarn("Failed to publish food order JSON: %s", exc)
+
+        return payload, stored_to_file
+
+    def _load_pause_speech_tts(self):
+        if not self.pause_prompt_use_speech_module:
+            return None
+
+        with self.pause_speech_lock:
+            if self.pause_speech_tts is not None:
+                return self.pause_speech_tts
+            if self.pause_speech_load_attempted:
+                return None
+
+            self.pause_speech_load_attempted = True
+            module_file = self.pause_prompt_speech_module_file
+
+            if not module_file or not os.path.isfile(module_file):
+                rospy.logwarn("Pause prompt speech module file not found: %s", module_file)
+                return None
+
+            try:
+                spec = importlib.util.spec_from_file_location("task5_pause_speech_synthesizer", module_file)
+                if spec is None or spec.loader is None:
+                    rospy.logwarn("Cannot build import spec for speech module: %s", module_file)
+                    return None
+
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                tts_cls = getattr(module, self.pause_prompt_speech_class)
+                tts_obj = tts_cls()
+                speak_fn = getattr(tts_obj, "speak", None)
+                if not callable(speak_fn):
+                    rospy.logwarn(
+                        "Speech class %s has no callable speak(text)",
+                        self.pause_prompt_speech_class,
+                    )
+                    return None
+
+                self.pause_speech_tts = tts_obj
+                rospy.loginfo(
+                    "Pause prompt speech module loaded: %s (%s)",
+                    module_file,
+                    self.pause_prompt_speech_class,
+                )
+                return self.pause_speech_tts
+            except Exception as exc:
+                rospy.logwarn("Pause prompt speech module load failed: %s", exc)
+                return None
+
+    def _speak_with_pause_speech_module(self, text):
+        tts_obj = self._load_pause_speech_tts()
+        if tts_obj is None:
+            return False
+
+        def _worker():
+            try:
+                with self.pause_speech_lock:
+                    tts_obj.speak(text)
+            except Exception as exc:
+                rospy.logwarn("Pause prompt speech module speak failed: %s", exc)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    def _load_pause_speech_asr(self):
+        if not (self.pause_reply_listen_enabled and self.pause_reply_use_speech_module):
+            return None
+
+        with self.pause_asr_lock:
+            if self.pause_speech_asr is not None:
+                return self.pause_speech_asr
+            if self.pause_asr_load_attempted:
+                return None
+
+            self.pause_asr_load_attempted = True
+            module_file = self.pause_reply_speech_module_file
+
+            if not module_file or not os.path.isfile(module_file):
+                rospy.logwarn("Pause reply ASR module file not found: %s", module_file)
+                return None
+
+            try:
+                spec = importlib.util.spec_from_file_location("task5_pause_speech_asr", module_file)
+                if spec is None or spec.loader is None:
+                    rospy.logwarn("Cannot build import spec for ASR module: %s", module_file)
+                    return None
+
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                asr_cls = getattr(module, self.pause_reply_speech_class)
+                asr_obj = asr_cls(self.pause_reply_mic_name)
+
+                stream = getattr(asr_obj, "stream", None)
+                vad_iterator = getattr(asr_obj, "vad_iterator", None)
+                model = getattr(asr_obj, "model", None)
+                if stream is None or vad_iterator is None or model is None:
+                    rospy.logwarn(
+                        "ASR class %s missing required fields: stream/vad_iterator/model",
+                        self.pause_reply_speech_class,
+                    )
+                    return None
+
+                self.pause_speech_asr = asr_obj
+                rospy.loginfo(
+                    "Pause reply ASR module loaded: %s (%s)",
+                    module_file,
+                    self.pause_reply_speech_class,
+                )
+                return self.pause_speech_asr
+            except Exception as exc:
+                rospy.logwarn("Pause reply ASR module load failed: %s", exc)
+                return None
+
+    def _transcribe_pause_reply_audio(self, asr_obj, audio_16k):
+        try:
+            import numpy as np
+        except Exception as exc:
+            rospy.logwarn("Pause reply ASR import numpy failed: %s", exc)
+            return ""
+
+        kwargs = {
+            "beam_size": self.pause_reply_beam_size,
+            "without_timestamps": True,
+        }
+        if self.pause_reply_language:
+            kwargs["language"] = self.pause_reply_language
+
+        try:
+            segments, _ = asr_obj.model.transcribe(audio_16k.astype(np.float32), **kwargs)
+            text = "".join(seg.text.strip() + " " for seg in segments).strip()
+            return text
+        except Exception as exc:
+            rospy.logwarn("Pause reply transcription failed: %s", exc)
+            return ""
+
+    def _listen_pause_reply_once(self):
+        asr_obj = self._load_pause_speech_asr()
+        if asr_obj is None:
+            return ""
+
+        try:
+            import numpy as np
+            import resampy
+        except Exception as exc:
+            rospy.logwarn("Pause reply ASR dependencies unavailable: %s", exc)
+            return ""
+
+        stream = asr_obj.stream
+        vad_iterator = asr_obj.vad_iterator
+        target_rate = int(getattr(asr_obj, "target_rate", 16000))
+        device_rate = int(getattr(asr_obj, "device_rate", 48000))
+        frame_samples_device = int(getattr(asr_obj, "frame_samples_device", int(device_rate * 32 / 1000)))
+        frame_samples_16k = int(getattr(asr_obj, "frame_samples_16k", int(target_rate * 32 / 1000)))
+
+        min_audio_samples = max(1, int(target_rate * self.pause_reply_min_audio_sec))
+        deadline = rospy.Time.now() + rospy.Duration(max(0.5, self.pause_reply_timeout))
+        buffer_16k = np.array([], dtype=np.float32)
+        is_speaking = False
+
+        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+            try:
+                data = stream.read(frame_samples_device, exception_on_overflow=False)
+            except Exception as exc:
+                rospy.logwarn("Pause reply audio read failed: %s", exc)
+                return ""
+
+            audio_dev = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                audio_16k = resampy.resample(
+                    audio_dev,
+                    sr_orig=device_rate,
+                    sr_new=target_rate,
+                    filter="kaiser_best",
+                )
+            except Exception:
+                audio_16k = resampy.resample(audio_dev, sr_orig=device_rate, sr_new=target_rate)
+
+            if len(audio_16k) > frame_samples_16k:
+                audio_16k = audio_16k[:frame_samples_16k]
+            elif len(audio_16k) < frame_samples_16k:
+                pad = frame_samples_16k - len(audio_16k)
+                audio_16k = np.concatenate([audio_16k, np.zeros(pad, dtype=np.float32)])
+
+            speech_dict = vad_iterator(audio_16k, return_seconds=False)
+            if speech_dict is not None and "start" in speech_dict:
+                is_speaking = True
+                buffer_16k = np.array([], dtype=np.float32)
+
+            if is_speaking:
+                buffer_16k = np.concatenate([buffer_16k, audio_16k])
+
+            if speech_dict is not None and "end" in speech_dict:
+                is_speaking = False
+                if len(buffer_16k) >= min_audio_samples:
+                    return self._transcribe_pause_reply_audio(asr_obj, buffer_16k)
+
+        if is_speaking and len(buffer_16k) >= min_audio_samples:
+            return self._transcribe_pause_reply_audio(asr_obj, buffer_16k)
+
+        return ""
+
+    def _process_pause_reply_text(self, text):
+        if not text:
+            return False
+
+        rospy.loginfo("Pause reply recognized: %s", text)
+        if self.pause_reply_pub is not None:
+            self.pause_reply_pub.publish(String(data=text))
+
+        food_summary, food_mentions = self._extract_food_items(text)
+        if food_summary:
+            payload, stored_to_file = self._store_food_order(text, food_summary, food_mentions)
+            summary_text = ", ".join(
+                ["%s x%d" % (k, food_summary[k]) for k in sorted(food_summary.keys())]
+            )
+            rospy.loginfo("Extracted requested foods: %s", summary_text)
+
+            if stored_to_file and payload is not None:
+                confirm_text = self._build_food_order_confirmation_text(payload)
+                if confirm_text:
+                    self._announce_text_prompt(confirm_text, force=True)
+
+            return True
+
+        rospy.loginfo("Reply recognized but not understood as a food order")
+        return False
+
+    def _pause_reply_worker(self):
+        try:
+            if self.pause_reply_start_delay > 1e-3:
+                rospy.sleep(self.pause_reply_start_delay)
+            text = self._listen_pause_reply_once()
+            if not text:
+                rospy.loginfo("Pause reply not recognized within %.1fs", self.pause_reply_timeout)
+                return
+
+            if self._process_pause_reply_text(text):
+                return
+
+            if not self.pause_reply_reask_on_unrecognized:
+                return
+
+            max_attempts = max(0, int(self.pause_reply_reask_max_attempts))
+            for attempt in range(max_attempts):
+                prompt_text = self.pause_reply_reask_text
+                if prompt_text:
+                    self._announce_text_prompt(prompt_text, force=True)
+
+                if self.pause_reply_reask_listen_delay > 1e-3:
+                    rospy.sleep(self.pause_reply_reask_listen_delay)
+
+                retry_text = self._listen_pause_reply_once()
+                if not retry_text:
+                    rospy.loginfo(
+                        "Pause reply retry %d/%d not recognized within %.1fs",
+                        attempt + 1,
+                        max_attempts,
+                        self.pause_reply_timeout,
+                    )
+                    continue
+
+                if self._process_pause_reply_text(retry_text):
+                    return
+
+                rospy.loginfo(
+                    "Pause reply retry %d/%d still not understood",
+                    attempt + 1,
+                    max_attempts,
+                )
+        except Exception as exc:
+            rospy.logwarn("Pause reply worker failed: %s", exc)
+        finally:
+            self._cleanup_pause_reply_asr()
+
+    def _trigger_pause_reply_listen(self):
+        if not self.pause_reply_listen_enabled:
+            return
+
+        now = rospy.Time.now()
+        if self.last_pause_reply_time != rospy.Time(0):
+            if (now - self.last_pause_reply_time).to_sec() < self.pause_reply_cooldown:
+                return
+
+        if self.pause_reply_thread is not None and self.pause_reply_thread.is_alive():
+            return
+
+        self.last_pause_reply_time = now
+        self.pause_reply_thread = threading.Thread(target=self._pause_reply_worker, daemon=True)
+        self.pause_reply_thread.start()
+
+    def _cleanup_pause_reply_asr(self):
+        with self.pause_asr_lock:
+            if self.pause_speech_asr is None:
+                return
+
+            cleanup_fn = getattr(self.pause_speech_asr, "cleanup", None)
+            if callable(cleanup_fn):
+                try:
+                    cleanup_fn()
+                except Exception:
+                    pass
+            self.pause_speech_asr = None
+            self.pause_asr_load_attempted = False
+
+    def _announce_text_prompt(self, text, force=False):
+        if not self.pause_prompt_enabled:
+            return False
+
+        text = str(text).strip()
+        if not text:
+            return False
+
+        now = rospy.Time.now()
+        if not force and self.last_pause_prompt_time != rospy.Time(0):
+            if (now - self.last_pause_prompt_time).to_sec() < self.pause_prompt_cooldown:
+                return False
+
+        announced = False
+
+        if self.pause_prompt_use_speech_module:
+            announced = self._speak_with_pause_speech_module(text)
+
+        if not announced and self.pause_prompt_pub is not None:
+            self.pause_prompt_pub.publish(String(data=text))
+            announced = True
+
+        if not announced and self.pause_prompt_command:
+            try:
+                cmd = self.pause_prompt_command.format(text=text)
+                if self.pause_prompt_use_shell:
+                    subprocess.Popen(cmd, shell=True)
+                else:
+                    subprocess.Popen(shlex.split(cmd))
+                announced = True
+            except Exception as exc:
+                rospy.logwarn("Pause prompt command failed: %s", exc)
+
+        if not announced:
+            try:
+                subprocess.Popen(["espeak", text])
+                announced = True
+            except Exception:
+                pass
+
+        if not announced:
+            rospy.loginfo("Pause prompt: %s", text)
+
+        self.last_pause_prompt_time = now
+        return announced
+
+    def _announce_pause_prompt(self):
+        return self._announce_text_prompt(self.pause_prompt_text, force=False)
+
     def _angle_diff_abs(self, a, b):
         return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
 
@@ -550,6 +1710,8 @@ class PersonGoalPublisher:
                     dist_to_goal,
                     held,
                 )
+                self._announce_pause_prompt()
+                self._trigger_pause_reply_listen()
                 return True
         else:
             self.goal_reach_since = None
@@ -640,14 +1802,17 @@ class PersonGoalPublisher:
 
     def run(self):
         rate = rospy.Rate(self.run_rate_hz)
-        while not rospy.is_shutdown():
-            self._run_gaze_tracking_cycle()
-            if (rospy.Time.now() - self.last_person_time).to_sec() > self.person_timeout:
-                rospy.logwarn_throttle(1.0, "Person target timeout, waiting for fresh detections.")
-                self._stop_gaze_tracking_cmd()
-            if self.grid is None:
-                rospy.logwarn_throttle(2.0, "No occupancy grid yet on %s, using fallback goals.", self.map_topic)
-            rate.sleep()
+        try:
+            while not rospy.is_shutdown():
+                self._run_gaze_tracking_cycle()
+                if (rospy.Time.now() - self.last_person_time).to_sec() > self.person_timeout:
+                    rospy.logwarn_throttle(1.0, "Person target timeout, waiting for fresh detections.")
+                    self._stop_gaze_tracking_cmd()
+                if self.grid is None:
+                    rospy.logwarn_throttle(2.0, "No occupancy grid yet on %s, using fallback goals.", self.map_topic)
+                rate.sleep()
+        finally:
+            self._cleanup_pause_reply_asr()
 
 
 if __name__ == "__main__":
