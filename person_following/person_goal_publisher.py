@@ -17,9 +17,9 @@ import math
 import rospy
 import tf2_geometry_msgs
 import tf2_ros
-from geometry_msgs.msg import PointStamped, PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
-from tf.transformations import quaternion_from_euler
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
 
 
 class PersonGoalPublisher:
@@ -54,6 +54,33 @@ class PersonGoalPublisher:
         self.goal_reach_distance = rospy.get_param("~goal_reach_distance", 0.28)
         self.goal_reach_hold_time = rospy.get_param("~goal_reach_hold_time", 1.0)
         self.person_reacquire_distance = rospy.get_param("~person_reacquire_distance", 0.45)
+        self.person_reacquire_forward = rospy.get_param("~person_reacquire_forward", 0.28)
+        self.person_reacquire_lateral = rospy.get_param("~person_reacquire_lateral", 0.20)
+        self.person_reacquire_heading_deg = rospy.get_param("~person_reacquire_heading_deg", 14.0)
+
+        # Gaze tracking stage after reaching a stable goal.
+        self.gaze_tracking_on_pause = rospy.get_param("~gaze_tracking_on_pause", True)
+        self.search_cmd_topic = rospy.get_param("~search_cmd_topic", "/person_following/search_cmd_vel")
+        self.gaze_yaw_deadband_deg = rospy.get_param("~gaze_yaw_deadband_deg", 4.0)
+        self.gaze_kp_angular = rospy.get_param("~gaze_kp_angular", 1.2)
+        self.gaze_max_angular = rospy.get_param("~gaze_max_angular", 0.45)
+        self.gaze_track_linear = rospy.get_param("~gaze_track_linear", True)
+        self.gaze_target_distance = rospy.get_param("~gaze_target_distance", self.follow_distance)
+        self.gaze_distance_tolerance = rospy.get_param("~gaze_distance_tolerance", 0.12)
+        self.gaze_kp_linear = rospy.get_param("~gaze_kp_linear", 0.30)
+        self.gaze_max_forward = rospy.get_param("~gaze_max_forward", 0.04)
+        self.gaze_max_reverse = rospy.get_param("~gaze_max_reverse", 0.06)
+        self.gaze_linear_heading_gate_deg = rospy.get_param("~gaze_linear_heading_gate_deg", 18.0)
+        self.gaze_track_lateral = rospy.get_param("~gaze_track_lateral", True)
+        self.gaze_kp_lateral = rospy.get_param("~gaze_kp_lateral", 0.22)
+        self.gaze_max_lateral = rospy.get_param("~gaze_max_lateral", 0.03)
+        self.gaze_lateral_deadband = rospy.get_param("~gaze_lateral_deadband", 0.05)
+        self.gaze_lateral_heading_gate_deg = rospy.get_param("~gaze_lateral_heading_gate_deg", 24.0)
+        self.gaze_collision_probe_distance = rospy.get_param("~gaze_collision_probe_distance", 0.55)
+        self.gaze_person_timeout = rospy.get_param("~gaze_person_timeout", 0.6)
+
+        # Run loop rate controls gaze-tracking and obstacle checks frequency.
+        self.run_rate_hz = rospy.get_param("~run_rate_hz", 20.0)
 
         # Candidate sampling and scoring.
         self.min_candidate_radius = rospy.get_param("~min_candidate_radius", 0.9)
@@ -85,6 +112,7 @@ class PersonGoalPublisher:
         self.goal_pub = rospy.Publisher(self.goal_topic, PoseStamped, queue_size=1)
         self.waypoint_pub = rospy.Publisher(self.waypoint_topic, PointStamped, queue_size=1)
         self.goal_point_pub = rospy.Publisher(self.goal_point_topic, PointStamped, queue_size=1)
+        self.search_cmd_pub = rospy.Publisher(self.search_cmd_topic, Twist, queue_size=1)
 
         rospy.Subscriber(self.person_topic, PointStamped, self.person_callback, queue_size=1)
         rospy.Subscriber(self.map_topic, OccupancyGrid, self.map_callback, queue_size=1)
@@ -99,6 +127,13 @@ class PersonGoalPublisher:
         self.goal_publish_paused = False
         self.paused_person_x = None
         self.paused_person_y = None
+        self.paused_person_base_x = None
+        self.paused_person_base_y = None
+        self.paused_person_heading = None
+        self.gaze_cmd_active = False
+        self.latest_person_base_x = None
+        self.latest_person_base_y = None
+        self.latest_person_base_time = rospy.Time(0)
 
         self.last_person_x = None
         self.last_person_y = None
@@ -289,6 +324,9 @@ class PersonGoalPublisher:
         return gx, gy, ang, score
 
     def _publish_goal(self, gx, gy, theta):
+        # Ensure nav command is not overridden by stale gaze-track commands.
+        self._stop_gaze_tracking_cmd()
+
         pose_goal = PoseStamped()
         pose_goal.header.frame_id = self.global_frame
         pose_goal.header.stamp = rospy.Time.now()
@@ -321,7 +359,127 @@ class PersonGoalPublisher:
         self.goal_reach_since = None
         rospy.loginfo_throttle(0.5, "Published follow goal: (%.2f, %.2f)", gx, gy)
 
-    def _update_reach_pause_state(self, rx, ry, px, py, now):
+    def _stop_gaze_tracking_cmd(self):
+        if not self.gaze_cmd_active:
+            return
+        self.search_cmd_pub.publish(Twist())
+        self.gaze_cmd_active = False
+
+    def _angle_diff_abs(self, a, b):
+        return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+
+    def _gaze_motion_allowed(self, rx, ry, robot_yaw, linear_x, linear_y):
+        motion_norm = math.hypot(linear_x, linear_y)
+        if motion_norm < 1e-4 or self.grid is None:
+            return True
+
+        # Convert desired robot-frame motion direction into global frame.
+        dir_x = linear_x / motion_norm
+        dir_y = linear_y / motion_norm
+        world_dx = dir_x * math.cos(robot_yaw) - dir_y * math.sin(robot_yaw)
+        world_dy = dir_x * math.sin(robot_yaw) + dir_y * math.cos(robot_yaw)
+
+        probe = self.gaze_collision_probe_distance
+        step = max(0.03, self.path_check_step * 0.6)
+        steps = max(2, int(probe / step))
+
+        # Multi-point probe for higher-frequency and more conservative collision checks.
+        for i in range(1, steps + 1):
+            d = probe * float(i) / float(steps)
+            tx = rx + d * world_dx
+            ty = ry + d * world_dy
+            if not self._is_pose_collision_free(tx, ty):
+                return False
+
+        tx = rx + probe * world_dx
+        ty = ry + probe * world_dy
+        return self._is_segment_collision_free(rx, ry, tx, ty)
+
+    def _lookup_robot_pose(self):
+        try:
+            robot_tf = self.tf_buffer.lookup_transform(
+                self.global_frame,
+                self.base_frame,
+                rospy.Time(0),
+                rospy.Duration(0.2),
+            )
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as exc:
+            rospy.logwarn_throttle(1.0, "Robot TF lookup failed: %s", exc)
+            return None
+
+        rx = robot_tf.transform.translation.x
+        ry = robot_tf.transform.translation.y
+        q = robot_tf.transform.rotation
+        robot_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])[2]
+        return rx, ry, robot_yaw
+
+    def _publish_gaze_tracking_cmd(self, px_base, py_base, rx, ry, robot_yaw):
+        cmd = Twist()
+
+        heading = math.atan2(py_base, px_base)
+        yaw_deadband = math.radians(self.gaze_yaw_deadband_deg)
+        if abs(heading) > yaw_deadband:
+            cmd.angular.z = max(
+                -self.gaze_max_angular,
+                min(self.gaze_max_angular, self.gaze_kp_angular * heading),
+            )
+
+        if self.gaze_track_linear:
+            dist = math.hypot(px_base, py_base)
+            err = dist - self.gaze_target_distance
+            heading_gate = math.radians(self.gaze_linear_heading_gate_deg)
+            if abs(err) > self.gaze_distance_tolerance and abs(heading) < heading_gate:
+                linear_v = self.gaze_kp_linear * err
+                linear_v = min(self.gaze_max_forward, max(-self.gaze_max_reverse, linear_v))
+                cmd.linear.x = linear_v
+
+        if self.gaze_track_lateral:
+            lateral_gate = math.radians(self.gaze_lateral_heading_gate_deg)
+            if abs(heading) < lateral_gate and abs(py_base) > self.gaze_lateral_deadband:
+                lateral_v = self.gaze_kp_lateral * py_base
+                lateral_v = max(-self.gaze_max_lateral, min(self.gaze_max_lateral, lateral_v))
+                cmd.linear.y = lateral_v
+
+        # Check combined translational motion; degrade gracefully if needed.
+        if not self._gaze_motion_allowed(rx, ry, robot_yaw, cmd.linear.x, cmd.linear.y):
+            if abs(cmd.linear.y) > 1e-4 and self._gaze_motion_allowed(rx, ry, robot_yaw, 0.0, cmd.linear.y):
+                cmd.linear.x = 0.0
+            elif abs(cmd.linear.x) > 1e-4 and self._gaze_motion_allowed(rx, ry, robot_yaw, cmd.linear.x, 0.0):
+                cmd.linear.y = 0.0
+            else:
+                cmd.linear.x = 0.0
+                cmd.linear.y = 0.0
+
+        self.search_cmd_pub.publish(cmd)
+        self.gaze_cmd_active = True
+
+    def _run_gaze_tracking_cycle(self):
+        if not (self.gaze_tracking_on_pause and self.goal_publish_paused):
+            return
+
+        if self.latest_person_base_time == rospy.Time(0):
+            self._stop_gaze_tracking_cmd()
+            return
+
+        if (rospy.Time.now() - self.latest_person_base_time).to_sec() > self.gaze_person_timeout:
+            self._stop_gaze_tracking_cmd()
+            return
+
+        pose = self._lookup_robot_pose()
+        if pose is None:
+            self._stop_gaze_tracking_cmd()
+            return
+
+        rx, ry, robot_yaw = pose
+        self._publish_gaze_tracking_cmd(
+            self.latest_person_base_x,
+            self.latest_person_base_y,
+            rx,
+            ry,
+            robot_yaw,
+        )
+
+    def _update_reach_pause_state(self, rx, ry, px, py, px_base, py_base, now):
         if not self.stop_publish_on_reach:
             return False
 
@@ -329,12 +487,43 @@ class PersonGoalPublisher:
         if self.goal_publish_paused:
             if self.paused_person_x is None or self.paused_person_y is None:
                 return True
+
             moved = math.hypot(px - self.paused_person_x, py - self.paused_person_y)
             if moved >= self.person_reacquire_distance:
                 self.goal_publish_paused = False
                 self.goal_reach_since = None
-                rospy.loginfo("Person moved %.2fm, resume goal publishing.", moved)
+                rospy.loginfo("Person moved globally %.2fm, resume goal publishing.", moved)
                 return False
+
+            # Base-frame criteria make pause exit more responsive for near-field motion.
+            if (
+                px_base is not None
+                and py_base is not None
+                and self.paused_person_base_x is not None
+                and self.paused_person_base_y is not None
+            ):
+                forward_shift = abs(px_base - self.paused_person_base_x)
+                lateral_shift = abs(py_base - self.paused_person_base_y)
+                heading_now = math.atan2(py_base, max(px_base, 1e-4))
+                heading_shift = 0.0
+                if self.paused_person_heading is not None:
+                    heading_shift = self._angle_diff_abs(heading_now, self.paused_person_heading)
+
+                if (
+                    forward_shift >= self.person_reacquire_forward
+                    or lateral_shift >= self.person_reacquire_lateral
+                    or heading_shift >= math.radians(self.person_reacquire_heading_deg)
+                ):
+                    self.goal_publish_paused = False
+                    self.goal_reach_since = None
+                    rospy.loginfo(
+                        "Person moved near-field (dx=%.2f, dy=%.2f, dtheta=%.1fdeg), resume goal publishing.",
+                        forward_shift,
+                        lateral_shift,
+                        math.degrees(heading_shift),
+                    )
+                return False
+
             return True
 
         if self.last_goal_x is None or self.last_goal_y is None:
@@ -350,6 +539,12 @@ class PersonGoalPublisher:
                 self.goal_publish_paused = True
                 self.paused_person_x = px
                 self.paused_person_y = py
+                self.paused_person_base_x = px_base
+                self.paused_person_base_y = py_base
+                if px_base is not None and py_base is not None:
+                    self.paused_person_heading = math.atan2(py_base, max(px_base, 1e-4))
+                else:
+                    self.paused_person_heading = None
                 rospy.loginfo(
                     "Goal reached (dist=%.2fm, held=%.2fs). Pause goal publishing until person moves.",
                     dist_to_goal,
@@ -362,7 +557,8 @@ class PersonGoalPublisher:
         return False
 
     def person_callback(self, msg):
-        self.last_person_time = rospy.Time.now()
+        now = rospy.Time.now()
+        self.last_person_time = now
 
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -376,27 +572,45 @@ class PersonGoalPublisher:
             rospy.logwarn_throttle(1.0, "TF transform failed: %s", exc)
             return
 
+        person_in_base = None
         try:
-            robot_tf = self.tf_buffer.lookup_transform(
-                self.global_frame,
-                self.base_frame,
-                rospy.Time(0),
-                rospy.Duration(0.2),
-            )
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as exc:
-            rospy.logwarn_throttle(1.0, "Robot TF lookup failed: %s", exc)
+            if msg.header.frame_id == self.base_frame:
+                person_in_base = msg
+            else:
+                base_tf = self.tf_buffer.lookup_transform(
+                    self.base_frame,
+                    msg.header.frame_id,
+                    rospy.Time(0),
+                    rospy.Duration(0.2),
+                )
+                person_in_base = tf2_geometry_msgs.do_transform_point(msg, base_tf)
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            person_in_base = None
+
+        if person_in_base is not None:
+            self.latest_person_base_x = person_in_base.point.x
+            self.latest_person_base_y = person_in_base.point.y
+            self.latest_person_base_time = now
+
+        pose = self._lookup_robot_pose()
+        if pose is None:
             return
 
-        rx = robot_tf.transform.translation.x
-        ry = robot_tf.transform.translation.y
+        rx, ry, robot_yaw = pose
         px = person_in_global.point.x
         py = person_in_global.point.y
+        px_base = None if person_in_base is None else person_in_base.point.x
+        py_base = None if person_in_base is None else person_in_base.point.y
 
-        stamp = rospy.Time.now()
+        stamp = now
 
         # If robot already reached a stable goal, stop publishing until person moves.
-        if self._update_reach_pause_state(rx, ry, px, py, stamp):
+        if self._update_reach_pause_state(rx, ry, px, py, px_base, py_base, stamp):
+            if not self.gaze_tracking_on_pause:
+                self._stop_gaze_tracking_cmd()
             return
+
+        self._stop_gaze_tracking_cmd()
 
         gx, gy, theta, cand_score, front_heading = self._select_goal(px, py, rx, ry, stamp)
 
@@ -425,10 +639,12 @@ class PersonGoalPublisher:
         self.last_goal_score = cand_score
 
     def run(self):
-        rate = rospy.Rate(5)
+        rate = rospy.Rate(self.run_rate_hz)
         while not rospy.is_shutdown():
+            self._run_gaze_tracking_cycle()
             if (rospy.Time.now() - self.last_person_time).to_sec() > self.person_timeout:
                 rospy.logwarn_throttle(1.0, "Person target timeout, waiting for fresh detections.")
+                self._stop_gaze_tracking_cmd()
             if self.grid is None:
                 rospy.logwarn_throttle(2.0, "No occupancy grid yet on %s, using fallback goals.", self.map_topic)
             rate.sleep()

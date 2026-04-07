@@ -119,6 +119,9 @@ Default behavior:
 - Transform person point to global frame (`map` by default).
 - Publish follow goal to `/move_base_simple/goal`.
 - Navigation stack / far_planner controls `/cmd_vel`.
+- When robot reaches stable near-goal region, goal publishing pauses.
+- During pause, gaze-tracking stage publishes low-speed tracking command to keep facing person.
+- If person moves beyond threshold, resume normal goal publishing.
 
 Optional runtime parameters:
 
@@ -128,6 +131,22 @@ python person_following/person_goal_publisher.py \
    _goal_update_distance:=0.25 \
    _goal_topic:=/move_base_simple/goal
 ```
+
+Useful pause/gaze parameters:
+
+- `_goal_reach_distance` (default: `0.28`)
+- `_goal_reach_hold_time` (default: `1.0`)
+- `_person_reacquire_distance` (default: `0.45`)
+- `_person_reacquire_forward` (default: `0.28`)
+- `_person_reacquire_lateral` (default: `0.20`)
+- `_person_reacquire_heading_deg` (default: `14.0`)
+- `_gaze_tracking_on_pause` (default: `true`)
+- `_gaze_track_linear` (default: `true`)
+- `_gaze_track_lateral` (default: `true`)
+- `_gaze_max_forward` (default: `0.04`)
+- `_gaze_max_lateral` (default: `0.03`)
+- `_run_rate_hz` (default: `20.0`, higher means more frequent gaze control updates)
+- `_gaze_collision_probe_distance` (default: `0.55`, forward/reverse collision probe distance)
 
 ### 5) One-Click Person Follow Stack
 

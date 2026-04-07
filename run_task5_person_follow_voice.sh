@@ -24,7 +24,7 @@ python3 person_following/pointcloud_to_occupancy_grid.py \
     _resolution:=0.10 \
     _robot_clear_radius:=0.45 \
     _inflate_radius:=0.20 \
-    _publish_rate:=8.0 &
+    _publish_rate:=15.0 &
  pids+=("$!")
 
 python3 person_following/person_goal_publisher.py \
@@ -48,7 +48,23 @@ python3 person_following/person_goal_publisher.py \
     _switch_score_margin:=0.35 \
     _switch_score_ratio:=0.15 \
     _goal_reach_hold_time:=1.0 \
-    _person_reacquire_distance:=0.45 &
+    _person_reacquire_distance:=0.45 \
+    _person_reacquire_forward:=0.28 \
+    _person_reacquire_lateral:=0.20 \
+    _person_reacquire_heading_deg:=14.0 \
+    _gaze_tracking_on_pause:=true \
+    _gaze_track_linear:=true \
+    _gaze_track_lateral:=true \
+    _gaze_yaw_deadband_deg:=4.0 \
+    _gaze_max_angular:=0.45 \
+    _gaze_max_forward:=0.04 \
+    _gaze_max_reverse:=0.05 \
+    _gaze_max_lateral:=0.03 \
+    _gaze_target_distance:=1.1 \
+    _gaze_distance_tolerance:=0.12 \
+    _gaze_collision_probe_distance:=0.55 \
+    _gaze_person_timeout:=0.6 \
+    _run_rate_hz:=20.0 &
  pids+=("$!")
 
 python3 person_following/cmd_vel_arbiter.py \
